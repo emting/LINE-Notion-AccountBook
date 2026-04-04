@@ -124,21 +124,35 @@ class NotionDatabaseClient:
         Returns:
             The created page object from the Notion API.
         """
+        # Map priority to Chinese
+        priority_map = {
+            "High": "High", "Medium": "Medium", "Low": "Low",
+            "高": "High", "中": "Medium", "低": "Low",
+        }
+        priority_cn = priority_map.get(priority, priority)
+
+        # Map status to Chinese
+        status_map = {
+            "Not Started": "Not Started", "In Progress": "In Progress",
+            "Done": "Done", "Cancelled": "Cancelled",
+        }
+        status_cn = status_map.get(status, status)
+
         properties = {
-            "Name": {
+            "任務名稱": {
                 "title": [
                     {
                         "text": {"content": title},
                     }
                 ],
             },
-            "Category": {
+            "分類": {
                 "select": {"name": category} if category else None,
             },
-            "Priority": {
-                "select": {"name": priority},
+            "優先級": {
+                "select": {"name": priority_cn},
             },
-            "Description": {
+            "原始訊息": {
                 "rich_text": [
                     {
                         "text": {"content": description[:2000]},
@@ -147,28 +161,23 @@ class NotionDatabaseClient:
                 if description
                 else [],
             },
-            "Source": {
+            "LINE 用戶 ID": {
                 "rich_text": [
                     {
-                        "text": {"content": f"LINE: {source_user}"},
+                        "text": {"content": source_user},
                     }
                 ]
                 if source_user
                 else [],
             },
-            "Status": {
-                "select": {"name": status},
-            },
-            "Created At": {
-                "date": {
-                    "start": datetime.now().isoformat(),
-                },
+            "狀態": {
+                "select": {"name": status_cn},
             },
         }
 
         # Add due date only if provided
         if due_date:
-            properties["Due Date"] = {
+            properties["截止日期"] = {
                 "date": {"start": due_date},
             }
 
