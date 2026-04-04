@@ -26,10 +26,17 @@ class NotionConfig:
 
 @dataclass
 class LLMConfig:
-    """OpenAI-compatible LLM API configuration."""
-    api_key: str = os.getenv("OPENAI_API_KEY", "")
-    base_url: str = os.getenv("OPENAI_BASE_URL", "")
-    model: str = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+    """
+    Google Gemini API configuration.
+
+    Uses GEMINI_API_KEY as the primary key.
+    Model defaults to gemini-2.0-flash which offers the best balance of
+    speed and capability for task parsing.
+    """
+    api_key: str = os.getenv("GEMINI_API_KEY", "")
+    model: str = os.getenv("LLM_MODEL", "models/gemini-2.5-flash")
+    # base_url kept for compatibility but not used with Gemini
+    base_url: str = os.getenv("LLM_BASE_URL", "")
 
 
 @dataclass

@@ -1,9 +1,9 @@
 """
-LLM-Powered Intelligent Parser Module.
+LLM-Powered Intelligent Parser Module (Gemini API).
 
-This module uses OpenAI-compatible LLM APIs to parse unstructured natural
-language text into structured task data. It replaces the keyword-based
-approach with true AI understanding, enabling:
+This module uses Google Gemini API to parse unstructured natural language
+text into structured task data. It replaces the keyword-based approach with
+true AI understanding, enabling:
 
     - Accurate intent recognition regardless of phrasing
     - Context-aware category classification
@@ -11,16 +11,17 @@ approach with true AI understanding, enabling:
     - Flexible date extraction from natural language expressions
     - Automatic summarization for task titles
 
-The module implements a fallback strategy: if the LLM API is unavailable
+The module implements a fallback strategy: if the Gemini API is unavailable
 or returns an error, it gracefully degrades to the rule-based parser.
 """
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Optional
 
-from openai import OpenAI
+import requests
 
 from config.settings import llm_config
 
@@ -31,13 +32,13 @@ SYSTEM_PROMPT = """你是一個專業的任務解析助手。你的工作是將�
 
 請根據使用者的訊息，提取以下欄位並以 JSON 格式回傳：
 
-{
+{{
   "title": "簡潔的任務標題（10-30字）",
   "category": "任務分類",
   "priority": "優先級",
   "due_date": "截止日期或null",
   "description": "任務的詳細描述"
-}
+}}
 
 欄位規則：
 1. **title**: 從訊息中提取核心任務，用簡潔的語句表達。不要照抄原文，要提煉重點。
@@ -55,46 +56,44 @@ SYSTEM_PROMPT = """你是一個專業的任務解析助手。你的工作是將�
 
 請只回傳 JSON，不要包含任何其他文字或 markdown 標記。"""
 
+# Gemini API endpoint
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
+
 
 class LLMParser:
     """
-    Uses LLM API to intelligently parse natural language into structured tasks.
+    Uses Google Gemini API to intelligently parse natural language into structured tasks.
 
-    This parser sends the user's message to an OpenAI-compatible LLM endpoint
-    along with a carefully crafted system prompt. The LLM returns structured
-    JSON which is then validated and converted into a ParsedTask object.
+    This parser sends the user's message to Gemini along with a carefully crafted
+    system prompt. The model returns structured JSON which is then validated and
+    converted into a ParsedTask object.
 
     Attributes:
-        client: The OpenAI client instance.
-        model: The model identifier to use for completions.
+        api_key: The Gemini API key.
+        model: The Gemini model identifier to use.
         enabled: Whether the LLM parser is active (requires valid API key).
     """
 
     def __init__(self):
+        self.api_key = llm_config.api_key
         self.model = llm_config.model
-        self.enabled = bool(llm_config.api_key)
+        self.enabled = bool(self.api_key)
 
         if self.enabled:
-            # Build client kwargs
-            client_kwargs = {"api_key": llm_config.api_key}
-            if llm_config.base_url:
-                client_kwargs["base_url"] = llm_config.base_url
-            self.client = OpenAI(**client_kwargs)
             logger.info(
-                "LLM Parser initialized with model: %s", self.model
+                "Gemini LLM Parser initialized with model: %s", self.model
             )
         else:
-            self.client = None
             logger.warning(
-                "LLM Parser disabled: OPENAI_API_KEY not configured. "
+                "Gemini LLM Parser disabled: GEMINI_API_KEY not configured. "
                 "Falling back to rule-based parsing."
             )
 
     def parse(self, text: str) -> Optional[dict]:
         """
-        Parse a text message using the LLM API.
+        Parse a text message using the Gemini API.
 
-        Sends the user's message to the LLM with a structured system prompt,
+        Sends the user's message to Gemini with a structured system prompt,
         then parses the JSON response into a dictionary.
 
         Args:
@@ -110,35 +109,76 @@ class LLMParser:
         today = datetime.now().strftime("%Y-%m-%d")
         system_prompt = SYSTEM_PROMPT.replace("{today}", today)
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.1,  # Low temperature for consistent parsing
-                max_tokens=500,
-                response_format={"type": "json_object"},
-            )
+        # Combine system prompt and user message for Gemini
+        full_prompt = f"{system_prompt}\n\n使用者訊息：{text}"
 
-            content = response.choices[0].message.content
-            if not content:
-                logger.warning("LLM returned empty response.")
+        url = GEMINI_API_URL.format(model=self.model)
+        headers = {"Content-Type": "application/json"}
+        params = {"key": self.api_key}
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": full_prompt}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 500,
+                "responseMimeType": "application/json"
+            }
+        }
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                params=params,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract text from Gemini response structure
+            candidates = data.get("candidates", [])
+            if not candidates:
+                logger.warning("Gemini returned no candidates.")
                 return None
 
+            content_parts = candidates[0].get("content", {}).get("parts", [])
+            if not content_parts:
+                logger.warning("Gemini returned empty content parts.")
+                return None
+
+            content = content_parts[0].get("text", "").strip()
+            if not content:
+                logger.warning("Gemini returned empty text.")
+                return None
+
+            # Clean up potential markdown code blocks
+            if content.startswith("```"):
+                lines = content.split("\n")
+                content = "\n".join(lines[1:-1])
+
             parsed = json.loads(content)
-            logger.info("LLM parsed result: %s", json.dumps(parsed, ensure_ascii=False)[:200])
+            logger.info(
+                "Gemini parsed result: %s",
+                json.dumps(parsed, ensure_ascii=False)[:200]
+            )
 
             # Validate required fields
             validated = self._validate_result(parsed)
             return validated
 
+        except requests.exceptions.RequestException as e:
+            logger.error("Gemini API request failed: %s", e)
+            return None
         except json.JSONDecodeError as e:
-            logger.error("Failed to parse LLM JSON response: %s", e)
+            logger.error("Failed to parse Gemini JSON response: %s", e)
             return None
         except Exception as e:
-            logger.error("LLM API call failed: %s", e)
+            logger.error("Gemini API call failed: %s", e)
             return None
 
     def _validate_result(self, parsed: dict) -> Optional[dict]:
@@ -196,4 +236,4 @@ class LLMParser:
 
     def is_available(self) -> bool:
         """Check if the LLM parser is enabled and ready."""
-        return self.enabled and self.client is not None
+        return self.enabled
