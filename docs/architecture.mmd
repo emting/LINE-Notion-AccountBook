@@ -1,0 +1,22 @@
+flowchart LR
+    subgraph Input["Input Layer"]
+        A["LINE User"] -->|Send Message| B["LINE Platform"]
+    end
+
+    subgraph Server["Processing Layer (Flask)"]
+        B -->|Webhook POST| C["Signature Verify"]
+        C --> D["Event Parser"]
+        D --> E["Data Processor"]
+    end
+
+    subgraph Output["Output Layer"]
+        E -->|Create Page| F["Notion Database"]
+        E -->|Reply Message| G["LINE Reply API"]
+    end
+
+    subgraph VCS["Version Control"]
+        H["GitHub Repository"]
+    end
+
+    G -->|Confirmation| A
+    Server -.->|Push Code| H
