@@ -18,6 +18,8 @@ Environment Variables Required:
     LINE_CHANNEL_SECRET        - LINE Messaging API channel secret
     NOTION_API_KEY             - Notion integration API key (internal integration)
     NOTION_DATABASE_ID         - Target Notion database ID
+    OPENAI_API_KEY             - OpenAI API key for LLM-powered parsing (optional)
+    LLM_MODEL                  - LLM model to use (default: gpt-4.1-mini)
 """
 
 import sys
@@ -62,7 +64,8 @@ def health_check():
     return jsonify({
         "status": "ok",
         "service": "LINE-Notion-Sync",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "llm_engine": "active" if data_processor.llm_parser.is_available() else "inactive",
     })
 
 
@@ -210,11 +213,13 @@ def _send_help_message(reply_token: str) -> None:
 
 def _send_status_message(reply_token: str) -> None:
     """Send a status message showing the system's current state."""
+    llm_status = "已啟用" if data_processor.llm_parser.is_available() else "未設定"
     try:
         schema = notion_client.get_database_schema()
         prop_names = list(schema.keys())
         status_text = (
             "✅ 系統狀態正常\n\n"
+            f"🧠 LLM 智慧解析：{llm_status}\n"
             f"📊 Notion 資料庫欄位：\n"
             f"  {', '.join(prop_names)}\n\n"
             f"🔗 連線狀態：正常"

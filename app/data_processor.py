@@ -2,9 +2,16 @@
 Data Processor Module.
 
 This module serves as the intelligent processing layer between LINE input
-and Notion output. It parses unstructured text messages from users and
-extracts structured task information including title, category, priority,
-due date, and description.
+and Notion output. It implements a dual-engine architecture:
+
+    1. **Primary Engine (LLM)**: Uses OpenAI-compatible LLM API for deep
+       natural language understanding, intelligent classification, and
+       context-aware parsing.
+    2. **Fallback Engine (Rule-based)**: Uses keyword matching and regex
+       patterns as a reliable fallback when the LLM is unavailable.
+
+The processor automatically selects the best available engine and ensures
+graceful degradation if the LLM API encounters errors.
 
 Supported input formats:
     1. Free-form text: "明天下午三點要開會，優先級高"
@@ -15,19 +22,21 @@ Supported input formats:
 import re
 import logging
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+
+from app.llm_parser import LLMParser
 
 logger = logging.getLogger(__name__)
 
-# Priority mapping for Chinese and English keywords
+# Priority mapping for Chinese and English keywords (fallback engine)
 PRIORITY_KEYWORDS = {
     "high": ["高", "緊急", "重要", "urgent", "high", "hi"],
     "medium": ["中", "一般", "普通", "medium", "med", "normal"],
     "low": ["低", "不急", "low", "lo"],
 }
 
-# Category keywords for auto-classification
+# Category keywords for auto-classification (fallback engine)
 CATEGORY_KEYWORDS = {
     "Meeting": ["會議", "開會", "meeting", "meet", "討論", "sync"],
     "Todo": ["待辦", "todo", "task", "做", "完成", "處理"],
@@ -38,7 +47,7 @@ CATEGORY_KEYWORDS = {
     "Feature": ["功能", "feature", "需求", "新增"],
 }
 
-# Relative date keywords
+# Relative date keywords (fallback engine)
 RELATIVE_DATE_KEYWORDS = {
     "今天": 0,
     "today": 0,
@@ -61,26 +70,38 @@ class ParsedTask:
     description: str = ""
     raw_text: str = ""
     parse_confidence: float = 0.0
+    parse_engine: str = "rule"  # "llm" or "rule"
 
 
 class DataProcessor:
     """
     Processes raw text messages and extracts structured task data.
 
-    The processor supports three input modes:
+    This processor uses a dual-engine strategy:
 
-    | Mode       | Example Input                                      | Detection Method        |
-    |------------|-----------------------------------------------------|-------------------------|
-    | Command    | /task 開會 --priority high --date 2026-04-05        | Starts with /task       |
-    | Structured | 標題: 開會 | 日期: 2026-04-05 | 優先級: 高          | Contains "|" separator  |
-    | Free-form  | 明天下午三點要開會，優先級高                          | Default fallback        |
+    | Engine   | Trigger Condition                    | Confidence | Capabilities                    |
+    |----------|--------------------------------------|------------|---------------------------------|
+    | LLM      | API key configured & API available   | 0.95       | Deep NLU, context-aware parsing |
+    | Rule     | LLM unavailable or returns error     | 0.6-0.9    | Keyword matching, regex parsing |
+
+    The LLM engine is used for free-form text where understanding context
+    and nuance is critical. Command and structured formats are always
+    handled by the rule engine since their format is deterministic.
     """
+
+    def __init__(self):
+        self.llm_parser = LLMParser()
+        if self.llm_parser.is_available():
+            logger.info("DataProcessor initialized with LLM engine (primary) + Rule engine (fallback).")
+        else:
+            logger.info("DataProcessor initialized with Rule engine only (LLM not configured).")
 
     def process(self, text: str) -> ParsedTask:
         """
         Main entry point for processing a text message.
 
         Detects the input format and delegates to the appropriate parser.
+        For free-form text, attempts LLM parsing first with rule-based fallback.
 
         Args:
             text: The raw text message from the LINE user.
@@ -92,22 +113,62 @@ class DataProcessor:
         if not text:
             return ParsedTask(raw_text=text)
 
-        # Detect input format and delegate
+        # Command and structured formats use deterministic rule engine
         if text.startswith("/task"):
             task = self._parse_command_format(text)
         elif "|" in text and ":" in text:
             task = self._parse_structured_format(text)
         else:
-            task = self._parse_freeform(text)
+            # Free-form text: try LLM first, fallback to rules
+            task = self._parse_with_llm_fallback(text)
 
         task.raw_text = text
         logger.info(
-            "Parsed task: title='%s', category='%s', priority='%s', "
+            "Parsed task [engine=%s]: title='%s', category='%s', priority='%s', "
             "due_date='%s', confidence=%.2f",
-            task.title, task.category, task.priority,
+            task.parse_engine, task.title, task.category, task.priority,
             task.due_date, task.parse_confidence,
         )
         return task
+
+    def _parse_with_llm_fallback(self, text: str) -> ParsedTask:
+        """
+        Attempt LLM parsing with graceful fallback to rule-based parsing.
+
+        This method implements the core dual-engine strategy:
+        1. If LLM is available, send the text for AI-powered parsing.
+        2. If LLM returns a valid result, use it with high confidence.
+        3. If LLM fails or is unavailable, fall back to the rule engine.
+
+        Args:
+            text: The free-form text message.
+
+        Returns:
+            A ParsedTask from either the LLM or rule engine.
+        """
+        if self.llm_parser.is_available():
+            logger.info("Attempting LLM parsing for: '%s'", text[:80])
+            llm_result = self.llm_parser.parse(text)
+
+            if llm_result and llm_result.get("title"):
+                task = ParsedTask(
+                    title=llm_result["title"],
+                    category=llm_result.get("category", "Todo"),
+                    priority=llm_result.get("priority", "Medium"),
+                    due_date=llm_result.get("due_date"),
+                    description=llm_result.get("description", ""),
+                    parse_confidence=0.95,
+                    parse_engine="llm",
+                )
+                logger.info("LLM parsing succeeded.")
+                return task
+            else:
+                logger.warning("LLM parsing returned no result, falling back to rule engine.")
+
+        # Fallback to rule-based parsing
+        return self._parse_freeform(text)
+
+    # ── Command Format Parser (Rule Engine) ───────────────────
 
     def _parse_command_format(self, text: str) -> ParsedTask:
         """
@@ -119,7 +180,7 @@ class DataProcessor:
         Returns:
             A ParsedTask with extracted fields.
         """
-        task = ParsedTask(parse_confidence=0.9)
+        task = ParsedTask(parse_confidence=0.9, parse_engine="rule")
 
         # Remove the /task prefix
         content = text[5:].strip()
@@ -150,6 +211,8 @@ class DataProcessor:
 
         return task
 
+    # ── Structured Format Parser (Rule Engine) ────────────────
+
     def _parse_structured_format(self, text: str) -> ParsedTask:
         """
         Parse structured input: 標題: xxx | 日期: xxx | 優先級: xxx
@@ -160,7 +223,7 @@ class DataProcessor:
         Returns:
             A ParsedTask with extracted fields.
         """
-        task = ParsedTask(parse_confidence=0.85)
+        task = ParsedTask(parse_confidence=0.85, parse_engine="rule")
         parts = [p.strip() for p in text.split("|")]
 
         field_map = {
@@ -179,7 +242,6 @@ class DataProcessor:
         for part in parts:
             if ":" not in part and "：" not in part:
                 continue
-            # Support both : and ：
             separator = "：" if "：" in part else ":"
             key, value = part.split(separator, 1)
             key = key.strip().lower()
@@ -202,11 +264,14 @@ class DataProcessor:
 
         return task
 
+    # ── Free-form Parser (Rule Engine Fallback) ───────────────
+
     def _parse_freeform(self, text: str) -> ParsedTask:
         """
-        Parse free-form natural language input.
+        Parse free-form natural language input using rule-based engine.
 
-        Uses keyword detection and pattern matching to extract task
+        This is the fallback parser used when the LLM engine is unavailable.
+        It uses keyword detection and pattern matching to extract task
         information from unstructured Chinese or English text.
 
         Args:
@@ -215,41 +280,33 @@ class DataProcessor:
         Returns:
             A ParsedTask with best-effort extracted fields.
         """
-        task = ParsedTask(parse_confidence=0.6)
+        task = ParsedTask(parse_confidence=0.6, parse_engine="rule")
 
-        # Extract priority from text
         task.priority = self._detect_priority(text)
-
-        # Extract date from text
         task.due_date = self._detect_date_in_text(text)
-
-        # Detect category
         task.category = self._detect_category(text)
 
-        # The title is the cleaned-up version of the text
+        # Clean up text to extract title
         title = text
-        # Remove priority keywords from title
         for keywords in PRIORITY_KEYWORDS.values():
             for kw in keywords:
                 title = re.sub(rf"[，,]?\s*優先級{kw}", "", title)
                 title = re.sub(rf"[，,]?\s*priority\s*{kw}", "", title, flags=re.IGNORECASE)
 
-        # Remove date-related phrases from title
         for kw in RELATIVE_DATE_KEYWORDS:
             title = title.replace(kw, "")
         title = re.sub(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "", title)
         title = re.sub(r"下午|上午|早上|晚上|中午", "", title)
         title = re.sub(r"\d{1,2}[點:時]\d{0,2}分?", "", title)
 
-        # Clean up
         title = re.sub(r"[，,。.、]\s*$", "", title.strip())
         title = re.sub(r"^\s*[，,。.、]", "", title.strip())
         task.title = title.strip() if title.strip() else text[:50]
 
-        # Use the full text as description for free-form input
         task.description = text
-
         return task
+
+    # ── Utility Methods ───────────────────────────────────────
 
     def _normalize_priority(self, value: str) -> str:
         """Normalize a priority value to High, Medium, or Low."""
@@ -278,27 +335,18 @@ class DataProcessor:
         return "Todo"
 
     def _parse_date(self, date_str: str) -> Optional[str]:
-        """
-        Parse a date string into ISO 8601 format (YYYY-MM-DD).
-
-        Supports:
-            - ISO format: 2026-04-05
-            - Slash format: 2026/04/05
-            - Relative keywords: 明天, 後天, 下週
-        """
+        """Parse a date string into ISO 8601 format (YYYY-MM-DD)."""
         date_str = date_str.strip()
 
-        # Check relative keywords first
         if date_str in RELATIVE_DATE_KEYWORDS:
             delta = RELATIVE_DATE_KEYWORDS[date_str]
             target = datetime.now() + timedelta(days=delta)
             return target.strftime("%Y-%m-%d")
 
-        # Try ISO format
         for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d", "%m-%d"):
             try:
                 parsed = datetime.strptime(date_str, fmt)
-                if parsed.year == 1900:  # No year provided
+                if parsed.year == 1900:
                     parsed = parsed.replace(year=datetime.now().year)
                 return parsed.strftime("%Y-%m-%d")
             except ValueError:
@@ -308,18 +356,15 @@ class DataProcessor:
 
     def _detect_date_in_text(self, text: str) -> Optional[str]:
         """Detect and extract date information from free-form text."""
-        # Check relative date keywords
         for keyword, delta in RELATIVE_DATE_KEYWORDS.items():
             if keyword in text:
                 target = datetime.now() + timedelta(days=delta)
                 return target.strftime("%Y-%m-%d")
 
-        # Check for explicit date patterns
         date_match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
         if date_match:
             return f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
 
-        # Check for month/day pattern without year
         date_match = re.search(r"(\d{1,2})[-/](\d{1,2})", text)
         if date_match:
             month = int(date_match.group(1))
@@ -339,8 +384,10 @@ class DataProcessor:
         Returns:
             A formatted confirmation string in Chinese.
         """
+        engine_label = "AI 智慧解析" if task.parse_engine == "llm" else "規則引擎解析"
         lines = [
             f"已成功將任務加入 Notion 資料庫！",
+            f"（{engine_label}，信心度 {task.parse_confidence:.0%}）",
             f"",
             f"📋 標題：{task.title}",
             f"📁 分類：{task.category}",

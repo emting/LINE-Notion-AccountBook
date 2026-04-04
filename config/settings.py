@@ -25,6 +25,14 @@ class NotionConfig:
 
 
 @dataclass
+class LLMConfig:
+    """OpenAI-compatible LLM API configuration."""
+    api_key: str = os.getenv("OPENAI_API_KEY", "")
+    base_url: str = os.getenv("OPENAI_BASE_URL", "")
+    model: str = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+
+
+@dataclass
 class AppConfig:
     """Application-level configuration."""
     host: str = os.getenv("APP_HOST", "0.0.0.0")
@@ -35,4 +43,5 @@ class AppConfig:
 # Singleton instances
 line_config = LineConfig()
 notion_config = NotionConfig()
+llm_config = LLMConfig()
 app_config = AppConfig()

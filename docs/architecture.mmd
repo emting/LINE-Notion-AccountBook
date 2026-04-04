@@ -6,17 +6,22 @@ flowchart LR
     subgraph Server["Processing Layer (Flask)"]
         B -->|Webhook POST| C["Signature Verify"]
         C --> D["Event Parser"]
-        D --> E["Data Processor"]
+        D --> E{"Format?"}
+        E -->|Command / Structured| F["Rule Engine"]
+        E -->|Free-form| G["LLM Engine\n(GPT-4.1-mini)"]
+        G -->|Fallback| F
     end
 
     subgraph Output["Output Layer"]
-        E -->|Create Page| F["Notion Database"]
-        E -->|Reply Message| G["LINE Reply API"]
+        F --> H["Notion Database"]
+        G --> H
+        F --> I["LINE Reply API"]
+        G --> I
     end
 
     subgraph VCS["Version Control"]
-        H["GitHub Repository"]
+        J["GitHub Repository"]
     end
 
-    G -->|Confirmation| A
-    Server -.->|Push Code| H
+    I -->|Confirmation| A
+    Server -.->|Push Code| J
