@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import uuid
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -45,7 +44,7 @@ class NotionConfig:
     """Notion API 設定。"""
 
     api_key: str = os.getenv("NOTION_API_KEY", "")
-    data_source_id: str = os.getenv("NOTION_DATA_SOURCE_ID", "")
+    database_id: str = os.getenv("NOTION_DATABASE_ID", "")
     api_version: str = os.getenv("NOTION_API_VERSION", "2022-06-28")
 
 
@@ -89,7 +88,7 @@ def validate_config() -> bool:
         "LINE_CHANNEL_ACCESS_TOKEN": line_config.channel_access_token,
         "LINE_CHANNEL_SECRET": line_config.channel_secret,
         "NOTION_API_KEY": notion_config.api_key,
-        "NOTION_DATA_SOURCE_ID": notion_config.data_source_id,
+        "NOTION_DATABASE_ID": notion_config.database_id,
         "GEMINI_API_KEY": llm_config.api_key,
     }
 
@@ -109,19 +108,6 @@ def validate_config() -> bool:
 
     if llm_config.api_key and not llm_config.vision_model:
         errors.append("VISION_MODEL cannot be empty when GEMINI_API_KEY is set")
-
-    if errors:
-        raise ConfigValidationError("\n".join(errors))
-
-    # Validate UUID format specifically for NOTION_DATA_SOURCE_ID to avoid Notion 404s
-    if notion_config.data_source_id:
-        try:
-            # This will fail and throw ValueError if there are trailing chars, non-hex, etc.
-            uuid_obj = uuid.UUID(notion_config.data_source_id)
-            if str(uuid_obj) != notion_config.data_source_id.lower() and uuid_obj.hex != notion_config.data_source_id.lower():
-                errors.append(f"NOTION_DATA_SOURCE_ID contains malformed uuid format. Please check the value.")
-        except ValueError:
-            errors.append(f"NOTION_DATA_SOURCE_ID is not a valid UUID (Length: {len(notion_config.data_source_id)}). Make sure it doesn't contain multiple IDs or URL parameters.")
 
     if errors:
         raise ConfigValidationError("\n".join(errors))
