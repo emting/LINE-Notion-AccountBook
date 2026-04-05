@@ -1,23 +1,11 @@
 """
-LLM-Powered Intelligent Parser Module (Gemini API).
-
-This module uses Google Gemini API to parse unstructured natural language
-text into structured task data. It replaces the keyword-based approach with
-true AI understanding, enabling:
-
-    - Accurate intent recognition regardless of phrasing
-    - Context-aware category classification
-    - Intelligent priority inference from tone and urgency cues
-    - Flexible date extraction from natural language expressions
-    - Automatic summarization for task titles
-
-The module implements a fallback strategy: if the Gemini API is unavailable
-or returns an error, it gracefully degrades to the rule-based parser.
+LLM 記帳解析引擎 — 將自然語言轉為結構化記帳資料。
+專為補習班收支場景最佳化 System Prompt。
 """
 
 import json
 import logging
-import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -27,213 +15,160 @@ from config.settings import llm_config
 
 logger = logging.getLogger(__name__)
 
-# System prompt that instructs the LLM how to parse user messages
-SYSTEM_PROMPT = """你是一個專業的任務解析助手。你的工作是將使用者傳送的自然語言訊息解析為結構化的任務資料。
+SYSTEM_PROMPT = """你是一個專業的補習班記帳助手。將使用者的訊息解析為結構化記帳資料。
 
-請根據使用者的訊息，提取以下欄位並以 JSON 格式回傳：
+請提取以下欄位並以 JSON 回傳：
 
-{{
-  "title": "簡潔的任務標題（10-30字）",
-  "category": "任務分類",
-  "priority": "優先級",
-  "due_date": "截止日期或null",
-  "description": "任務的詳細描述"
-}}
+{
+  "title": "記帳摘要（簡潔描述）",
+  "amount": 金額（正數）,
+  "type": "收入" 或 "支出",
+  "category": "分類",
+  "date": "日期 YYYY-MM-DD 或 null",
+  "vendor": "對象/廠商名稱（若有）",
+  "payment_method": "現金/刷卡/轉帳/LINE Pay/未指定",
+  "description": "完整描述",
+  "invoice_number": "發票號碼（若有）",
+  "tax_amount": 稅額（若有）
+}
 
-欄位規則：
-1. **title**: 從訊息中提取核心任務，用簡潔的語句表達。不要照抄原文，要提煉重點。
-2. **category**: 必須是以下其中之一：Meeting, Todo, Reminder, Note, Idea, Bug, Feature, Research, Communication。根據訊息內容智慧判斷最適合的分類。
-3. **priority**: 必須是 High, Medium, Low 其中之一。根據以下線索判斷：
-   - High: 包含「緊急」「重要」「馬上」「立刻」「ASAP」「deadline」等詞彙，或語氣急迫
-   - Medium: 一般性任務，沒有特別的時間壓力
-   - Low: 包含「有空再」「不急」「之後」「考慮」等詞彙
-4. **due_date**: 如果訊息中提到時間，轉換為 ISO 8601 格式（YYYY-MM-DD）。今天的日期是 {today}。
-   - 「明天」→ 明天的日期
-   - 「下週一」→ 下週一的日期
-   - 「月底」→ 本月最後一天
-   - 如果沒有提到時間，回傳 null
-5. **description**: 保留原始訊息的完整語意，補充任何有用的上下文資訊。
+分類規則（category 必須是以下之一）：
+【收入類】
+- 學費收入：學生繳交的學費、補習費、課程費
+- 教材收入：販售講義、課本的收入
+- 報名費：新生報名費、活動報名費
+- 其他收入：利息、補助款、退款收回等
 
-請只回傳 JSON，不要包含任何其他文字或 markdown 標記。"""
+【支出類】
+- 教材費：購買講義、教科書、文具
+- 房租水電：房租、水費、電費、網路費
+- 人事費用：教師薪資、助教費、工讀費
+- 設備維護：電腦、投影機、冷氣維修
+- 辦公用品：影印紙、墨水匣、辦公耗材
+- 餐飲點心：學生點心、教師餐費
+- 交通費：交通、停車、油費
+- 廣告行銷：傳單、網路廣告、招牌
+- 保險稅務：保險費、稅金
+- 其他支出：無法歸類的支出
 
-# Gemini API endpoint
+判斷規則：
+1. 「收到」「繳費」「入帳」→ 收入
+2. 「買」「付」「繳」「支付」「花」→ 支出
+3. 未明確指定類型時，根據內容智慧判斷
+4. 今天日期: {today}
+
+請只回傳 JSON。"""
+
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
 
-
 class LLMParser:
-    """
-    Uses Google Gemini API to intelligently parse natural language into structured tasks.
-
-    This parser sends the user's message to Gemini along with a carefully crafted
-    system prompt. The model returns structured JSON which is then validated and
-    converted into a ParsedTask object.
-
-    Attributes:
-        api_key: The Gemini API key.
-        model: The Gemini model identifier to use.
-        enabled: Whether the LLM parser is active (requires valid API key).
-    """
-
     def __init__(self):
         self.api_key = llm_config.api_key
         self.model = llm_config.model
         self.enabled = bool(self.api_key)
 
-        if self.enabled:
-            logger.info(
-                "Gemini LLM Parser initialized with model: %s", self.model
-            )
-        else:
-            logger.warning(
-                "Gemini LLM Parser disabled: GEMINI_API_KEY not configured. "
-                "Falling back to rule-based parsing."
-            )
-
     def parse(self, text: str) -> Optional[dict]:
         """
-        Parse a text message using the Gemini API.
-
-        Sends the user's message to Gemini with a structured system prompt,
-        then parses the JSON response into a dictionary.
-
-        Args:
-            text: The raw text message from the user.
-
-        Returns:
-            A dictionary with keys: title, category, priority, due_date,
-            description. Returns None if parsing fails or LLM is disabled.
+        解析自然語言文字。
+        (Optimization #6: Added retry mechanism)
         """
         if not self.enabled:
             return None
 
         today = datetime.now().strftime("%Y-%m-%d")
-        system_prompt = SYSTEM_PROMPT.replace("{today}", today)
-
-        # Combine system prompt and user message for Gemini
-        full_prompt = f"{system_prompt}\n\n使用者訊息：{text}"
+        prompt = SYSTEM_PROMPT.replace("{today}", today)
+        full_prompt = f"{prompt}\n\n使用者訊息：{text}"
 
         url = GEMINI_API_URL.format(model=self.model)
         headers = {"Content-Type": "application/json"}
         params = {"key": self.api_key}
 
         payload = {
-            "contents": [
-                {
-                    "parts": [{"text": full_prompt}]
-                }
-            ],
+            "contents": [{"parts": [{"text": full_prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 500,
+                "maxOutputTokens": 800,
                 "responseMimeType": "application/json"
             }
         }
 
-        try:
-            response = requests.post(
-                url,
-                headers=headers,
-                params=params,
-                json=payload,
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
+        # 指數退避重試 (Optimization #6)
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = requests.post(
+                    url, headers=headers, params=params,
+                    json=payload, timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
 
-            # Extract text from Gemini response structure
-            candidates = data.get("candidates", [])
-            if not candidates:
-                logger.warning("Gemini returned no candidates.")
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    return None
+
+                content = candidates[0].get("content", {}).get("parts", [])
+                if not content:
+                    return None
+
+                text_result = content[0].get("text", "").strip()
+                if text_result.startswith("```"):
+                    lines = text_result.split("\n")
+                    text_result = "\n".join(lines[1:-1])
+
+                parsed = json.loads(text_result)
+                return self._validate_result(parsed)
+
+            except (Exception) as e:
+                logger.error("LLM parsing (Attempt %d) failed: %s", attempt + 1, e)
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                else:
+                    return None
+            except json.JSONDecodeError as e:
+                logger.error("Failed to parse LLM JSON: %s", e)
                 return None
-
-            content_parts = candidates[0].get("content", {}).get("parts", [])
-            if not content_parts:
-                logger.warning("Gemini returned empty content parts.")
-                return None
-
-            content = content_parts[0].get("text", "").strip()
-            if not content:
-                logger.warning("Gemini returned empty text.")
-                return None
-
-            # Clean up potential markdown code blocks
-            if content.startswith("```"):
-                lines = content.split("\n")
-                content = "\n".join(lines[1:-1])
-
-            parsed = json.loads(content)
-            logger.info(
-                "Gemini parsed result: %s",
-                json.dumps(parsed, ensure_ascii=False)[:200]
-            )
-
-            # Validate required fields
-            validated = self._validate_result(parsed)
-            return validated
-
-        except requests.exceptions.RequestException as e:
-            logger.error("Gemini API request failed: %s", e)
-            return None
-        except json.JSONDecodeError as e:
-            logger.error("Failed to parse Gemini JSON response: %s", e)
-            return None
-        except Exception as e:
-            logger.error("Gemini API call failed: %s", e)
-            return None
 
     def _validate_result(self, parsed: dict) -> Optional[dict]:
-        """
-        Validate and normalize the LLM's parsed output.
-
-        Ensures all required fields are present and values are within
-        expected ranges. Invalid values are corrected to defaults.
-
-        Args:
-            parsed: The raw dictionary from the LLM's JSON response.
-
-        Returns:
-            A validated dictionary, or None if the result is unusable.
-        """
+        """驗證並正規化 LLM 回傳的記帳資料。"""
         valid_categories = {
-            "Meeting", "Todo", "Reminder", "Note", "Idea",
-            "Bug", "Feature", "Research", "Communication",
+            "學費收入", "教材收入", "報名費", "其他收入",
+            "教材費", "房租水電", "人事費用", "設備維護",
+            "辦公用品", "餐飲點心", "交通費", "廣告行銷",
+            "保險稅務", "其他支出",
         }
-        valid_priorities = {"High", "Medium", "Low"}
 
-        result = {}
-
-        # Title is required
         title = parsed.get("title", "").strip()
         if not title:
-            logger.warning("LLM result missing title.")
             return None
-        result["title"] = title
 
-        # Category with fallback
-        category = parsed.get("category", "Todo")
-        result["category"] = category if category in valid_categories else "Todo"
+        amount = parsed.get("amount")
+        try:
+            amount = abs(float(amount)) if amount is not None else 0
+        except (ValueError, TypeError):
+            amount = 0
 
-        # Priority with fallback
-        priority = parsed.get("priority", "Medium")
-        result["priority"] = priority if priority in valid_priorities else "Medium"
+        entry_type = parsed.get("type", "支出")
+        if entry_type not in ("收入", "支出"):
+            entry_type = "支出"
 
-        # Due date validation
-        due_date = parsed.get("due_date")
-        if due_date and due_date != "null":
-            try:
-                datetime.strptime(str(due_date), "%Y-%m-%d")
-                result["due_date"] = str(due_date)
-            except (ValueError, TypeError):
-                logger.warning("Invalid due_date from LLM: %s", due_date)
-                result["due_date"] = None
-        else:
-            result["due_date"] = None
+        category = parsed.get("category", "其他支出")
+        if category not in valid_categories:
+            category = "其他收入" if entry_type == "收入" else "其他支出"
 
-        # Description
-        result["description"] = parsed.get("description", "")
-
+        result = {
+            "title": title,
+            "amount": amount,
+            "type": entry_type,
+            "category": category,
+            "date": parsed.get("date"),
+            "vendor": parsed.get("vendor", ""),
+            "payment_method": parsed.get("payment_method", "未指定"),
+            "description": parsed.get("description", ""),
+            "invoice_number": parsed.get("invoice_number", ""),
+            "tax_amount": parsed.get("tax_amount", 0),
+        }
         return result
 
     def is_available(self) -> bool:
-        """Check if the LLM parser is enabled and ready."""
         return self.enabled

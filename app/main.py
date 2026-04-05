@@ -1,30 +1,12 @@
 """
-LINE-Notion-Sync: Main Application Entry Point.
-
-This Flask application serves as the webhook endpoint for LINE Messaging API.
-When a user sends a text message via LINE, the application:
-
-    1. Receives and verifies the webhook event from LINE Platform.
-    2. Extracts the text content from the message event.
-    3. Processes and parses the text into structured task data.
-    4. Creates a corresponding entry in the configured Notion database.
-    5. Sends a confirmation reply back to the user via LINE.
-
-Usage:
-    python -m app.main
-
-Environment Variables Required:
-    LINE_CHANNEL_ACCESS_TOKEN  - LINE Messaging API channel access token
-    LINE_CHANNEL_SECRET        - LINE Messaging API channel secret
-    NOTION_API_KEY             - Notion integration API key (internal integration)
-    NOTION_DATABASE_ID         - Target Notion database ID
-    OPENAI_API_KEY             - OpenAI API key for LLM-powered parsing (optional)
-    LLM_MODEL                  - LLM model to use (default: gpt-4.1-mini)
+LINE-Notion-AccountBook: 補習班記帳系統主入口。
+支援文字記帳 + 發票/收據圖片 OCR。
 """
 
 import sys
 import os
 import logging
+import threading
 
 # Add project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,214 +14,196 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from flask import Flask, request, abort, jsonify
 
 from app.line_handler import LineWebhookHandler, LineSignatureError
-from app.notion_client import NotionDatabaseClient, NotionClientError
+from app.notion_client import NotionAccountClient, NotionClientError
 from app.data_processor import DataProcessor
 from config.settings import app_config
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
 app = Flask(__name__)
-
-# Initialize service components
 line_handler = LineWebhookHandler()
-notion_client = NotionDatabaseClient()
+notion_client = NotionAccountClient()
 data_processor = DataProcessor()
-
 
 @app.route("/", methods=["GET"])
 def health_check():
-    """
-    Health check endpoint.
-
-    Returns a simple JSON response to confirm the server is running.
-    Useful for monitoring and load balancer health checks.
-    """
     return jsonify({
         "status": "ok",
-        "service": "LINE-Notion-Sync",
-        "version": "2.0.0",
+        "service": "LINE-Notion-AccountBook",
+        "version": "3.1.0",
+        "school": app_config.school_name,
         "llm_engine": "active" if data_processor.llm_parser.is_available() else "inactive",
+        "ocr_engine": "active" if data_processor.ocr_engine.is_available() else "inactive",
     })
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    LINE Messaging API Webhook Endpoint.
-
-    This endpoint receives POST requests from the LINE Platform whenever
-    a user interacts with the LINE Official Account. The full processing
-    pipeline is executed here:
-
-        LINE Platform → Signature Verification → Event Parsing →
-        Text Extraction → Data Processing → Notion Write → LINE Reply
-
-    Returns:
-        200 OK on success (required by LINE Platform).
-        400 Bad Request if the signature header is missing.
-        403 Forbidden if signature verification fails.
-        500 Internal Server Error on unexpected failures.
-    """
-    # Step 1: Get the request signature
     signature = request.headers.get("X-Line-Signature")
     if not signature:
-        logger.warning("Missing X-Line-Signature header.")
         abort(400, description="Missing X-Line-Signature header")
 
-    # Step 2: Get the raw request body
     body = request.get_data(as_text=True)
-    logger.info("Received webhook request (body length: %d)", len(body))
 
-    # Step 3: Verify the signature
     try:
         line_handler.verify_signature(body, signature)
     except LineSignatureError:
-        logger.warning("Signature verification failed.")
         abort(403, description="Invalid signature")
 
-    # Step 4: Parse events from the webhook body
     events = line_handler.parse_events(body)
-
-    # Step 5: Process each event
     for event in events:
         try:
             _process_event(event)
         except Exception as e:
             logger.error("Error processing event: %s", e, exc_info=True)
-            # Continue processing other events even if one fails
 
     return "OK", 200
 
-
 def _process_event(event: dict) -> None:
-    """
-    Process a single LINE webhook event.
-
-    This function orchestrates the full pipeline for a single event:
-    extract text, parse it, write to Notion, and reply to the user.
-
-    Args:
-        event: A single webhook event dictionary from LINE.
-    """
-    # Extract text message
-    text = line_handler.extract_text_message(event)
-    if not text:
-        return
-
+    """處理單一 LINE 事件（文字或圖片）。"""
     user_id = line_handler.get_user_id(event)
     reply_token = line_handler.get_reply_token(event)
 
-    # Get user profile for the source field
     user_name = "Unknown"
     if user_id:
         profile = line_handler.get_user_profile(user_id)
         if profile:
             user_name = profile.get("displayName", "Unknown")
 
-    logger.info("Processing message from '%s': '%s'", user_name, text[:80])
+    # ── 文字訊息 ──────────────────────────
+    text = line_handler.extract_text_message(event)
+    if text:
+        # 特殊指令
+        if text.lower() in ("/help", "help", "幫助"):
+            _send_help(reply_token)
+            return
+        if text.lower() in ("/status", "status", "狀態"):
+            _send_status(reply_token)
+            return
 
-    # Handle special commands
-    if text.lower() in ("/help", "help", "幫助"):
-        _send_help_message(reply_token)
+        entry = data_processor.process_text(text)
+        if not entry.title or entry.amount == 0:
+            line_handler.reply_message(
+                reply_token,
+                "無法解析金額，請重新輸入。\n\n"
+                "支援格式：\n"
+                "1. 自由輸入：買了 30 本講義 $4500\n"
+                "2. 結構化：摘要: 講義 | 金額: 4500 | 類型: 支出\n"
+                "3. 指令：/支 講義 4500\n"
+                "4. 📸 直接拍發票照片",
+            )
+            return
+
+        _write_to_notion(entry, user_name, reply_token)
         return
 
-    if text.lower() in ("/status", "status", "狀態"):
-        _send_status_message(reply_token)
-        return
-
-    # Parse the message into structured task data
-    task = data_processor.process(text)
-
-    if not task.title:
+    # ── 圖片訊息（OCR）───────────────────
+    image_id = line_handler.extract_image_message(event)
+    if image_id:
         line_handler.reply_message(
             reply_token,
-            "無法解析您的訊息，請重新輸入。\n\n"
-            "支援的格式：\n"
-            "1. 自由輸入：明天下午三點要開會\n"
-            "2. 結構化：標題: 開會 | 日期: 2026-04-05 | 優先級: 高\n"
-            "3. 指令：/task 開會 --priority high --date 2026-04-05",
+            "📸 收到圖片，正在進行 OCR 辨識中..."
         )
-        return
+        
+        # Bug #4: OCR 辨識耗時，改用背景執行緒處理 (非同步)
+        threading.Thread(
+            target=_process_image_async,
+            args=(image_id, user_name, user_id),
+            daemon=True,
+        ).start()
 
-    # Write to Notion database
+def _process_image_async(image_id: str, user_name: str, user_id: str):
+    """背景處理圖片 OCR 並寫入 Notion。"""
     try:
-        notion_client.create_task_entry(
-            title=task.title,
-            category=task.category,
-            priority=task.priority,
-            due_date=task.due_date,
-            description=task.description,
+        image_bytes = line_handler.download_image(image_id)
+        if not image_bytes:
+            return
+
+        entry = data_processor.process_image(image_bytes)
+        if entry.amount == 0 and entry.parse_confidence < 0.3:
+            logger.warning("OCR failed or no amount detected for image %s", image_id)
+            line_handler.push_message(user_id, "⚠️ 無法從圖片中辨識出有效的金額或品項。")
+            return
+
+        # 寫入 Notion 並發送 Push Message
+        notion_client.create_account_entry(
+            title=entry.title,
+            amount=entry.amount,
+            entry_type=entry.entry_type,
+            category=entry.category,
+            date=entry.date,
+            vendor=entry.vendor,
+            payment_method=entry.payment_method,
+            description=entry.description,
+            invoice_number=entry.invoice_number,
+            tax_amount=entry.tax_amount,
             source_user=user_name,
-            status="Not Started",
         )
-        logger.info("Task '%s' written to Notion successfully.", task.title)
+        confirmation = data_processor.format_confirmation(entry)
+        line_handler.push_message(user_id, confirmation)
+        
+    except Exception as e:
+        logger.error("Async OCR processing error: %s", e, exc_info=True)
+        line_handler.push_message(user_id, f"❌ 處理圖片時發生錯誤：{str(e)}")
 
-        # Send confirmation reply
-        confirmation = data_processor.format_confirmation_message(task)
+def _write_to_notion(entry, user_name, reply_token):
+    """文字訊息場景：寫入 Notion 並用 reply 回覆。"""
+    try:
+        notion_client.create_account_entry(
+            title=entry.title,
+            amount=entry.amount,
+            entry_type=entry.entry_type,
+            category=entry.category,
+            date=entry.date,
+            vendor=entry.vendor,
+            payment_method=entry.payment_method,
+            description=entry.description,
+            invoice_number=entry.invoice_number,
+            tax_amount=entry.tax_amount,
+            source_user=user_name,
+        )
+        confirmation = data_processor.format_confirmation(entry)
         line_handler.reply_message(reply_token, confirmation)
-
     except NotionClientError as e:
-        logger.error("Failed to write to Notion: %s", e)
         line_handler.reply_message(
             reply_token,
-            f"寫入 Notion 資料庫時發生錯誤：{str(e)}\n請確認 Notion 設定是否正確。",
+            f"寫入 Notion 時發生錯誤：{e}\n請確認資料庫設定。",
         )
 
-
-def _send_help_message(reply_token: str) -> None:
-    """Send a help message explaining supported input formats."""
+def _send_help(reply_token):
     help_text = (
-        "📖 LINE-Notion-Sync 使用說明\n"
+        f"📖 {app_config.school_name} 記帳系統\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📝 自由輸入（自動解析）：\n"
-        "  明天下午三點要開會，優先級高\n\n"
+        "📝 文字記帳：\n"
+        "  買了 30 本數學講義 $4,500\n\n"
+        "📸 拍照記帳：\n"
+        "  直接拍發票或收據照片\n\n"
         "📋 結構化輸入：\n"
-        "  標題: 開會 | 日期: 2026-04-05 | 優先級: 高\n\n"
+        "  摘要: 講義 | 金額: 4500 | 類型: 支出\n\n"
         "⌨️ 指令格式：\n"
-        "  /task 開會 --priority high --date 2026-04-05\n\n"
+        "  /支 數學講義 4500\n"
+        "  /收 王小明學費 12000\n\n"
         "🔧 其他指令：\n"
         "  /help - 顯示此說明\n"
         "  /status - 查看系統狀態"
     )
     line_handler.reply_message(reply_token, help_text)
 
-
-def _send_status_message(reply_token: str) -> None:
-    """Send a status message showing the system's current state."""
-    llm_status = "已啟用" if data_processor.llm_parser.is_available() else "未設定"
-    try:
-        schema = notion_client.get_database_schema()
-        prop_names = list(schema.keys())
-        status_text = (
-            "✅ 系統狀態正常\n\n"
-            f"🧠 LLM 智慧解析：{llm_status}\n"
-            f"📊 Notion 資料庫欄位：\n"
-            f"  {', '.join(prop_names)}\n\n"
-            f"🔗 連線狀態：正常"
-        )
-    except NotionClientError:
-        status_text = (
-            "⚠️ 系統狀態異常\n\n"
-            "❌ 無法連線至 Notion 資料庫\n"
-            "請確認 NOTION_API_KEY 和 NOTION_DATABASE_ID 是否正確設定。"
-        )
-
+def _send_status(reply_token):
+    llm = "已啟用" if data_processor.llm_parser.is_available() else "未設定"
+    ocr = "已啟用" if data_processor.ocr_engine.is_available() else "未設定"
+    status_text = (
+        f"✅ {app_config.school_name} 記帳系統\n\n"
+        f"🧠 LLM 智慧解析：{llm}\n"
+        f"📸 OCR 發票辨識：{ocr}\n"
+        f"🔗 Notion 連線：正常"
+    )
     line_handler.reply_message(reply_token, status_text)
 
-
 if __name__ == "__main__":
-    logger.info(
-        "Starting LINE-Notion-Sync server on %s:%d",
-        app_config.host,
-        app_config.port,
-    )
     app.run(
         host=app_config.host,
         port=app_config.port,

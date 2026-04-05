@@ -1,1 +1,1 @@
-# LINE-Notion-Sync Application Package
+# Empty file to make 'app' a package
