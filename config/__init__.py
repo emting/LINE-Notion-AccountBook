@@ -1,1 +1,1 @@
-# Empty file to make 'config' a package
+"""Configuration package for LINE-Notion-AccountBook."""

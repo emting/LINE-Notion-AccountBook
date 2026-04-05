@@ -1,1 +1,1 @@
-# Empty file to make 'app' a package
+"""LINE-Notion-AccountBook application package."""
