@@ -1,111 +1,134 @@
-# LINE-Notion-Sync
+# LINE-Notion-AccountBook 補習班記帳系統 (v3.1.0)
 
-一個展示 Manus 1.6 Max 跨平台整合能力的自動化工作流專案。透過 LINE 官方帳號接收使用者訊息，經由 **LLM 智慧解析引擎**（GPT-4.1-mini）將自然語言轉換為結構化任務資料，自動寫入 Notion 資料庫，並回傳確認訊息。
+專為**補習班日常收支管理**設計的自動化記帳系統。老師或行政人員只需在 LINE 中輸入記帳文字，或是直接拍照上傳發票/收據，系統便會透過 **Gemini Vision OCR** 與 **LLM 智慧解析引擎** 將資料解析為結構化內容，並自動寫入 Notion 的記帳資料庫。
 
-## 系統架構
+## 🌟 核心特色 (v3.1.0 新增與優化)
 
-![系統架構圖](docs/architecture.png)
+- **Gemini Vision OCR 圖片解析**：上傳發票或收據，自動辨識金額、消費對象與品項。
+- **Gemini LLM 智慧分類**：內建 14 種補習班專用分類（如：教材費、人事費用、學費收入），由 LLM 自動從自然語言中萃取並分類。
+- **雙引擎降級機制 (Dual-Engine Fallback)**：當 LLM 服務失敗時，無縫降級至 Rule Engine（關鍵字與正則表達式解析），確保服務不中斷。
+- **非同步事件處理**：圖片 OCR 處理耗時較長，系統採用背景 Threading 處理，避免 LINE Webhook 發生 504 Timeout。
+- **穩定的 API 重試機制**：對外連線（呼叫 Gemini API）全面實作指數退避重試（Exponential Backoff）。
+- **Fail-Fast 組態驗證**：應用啟動時立即透過 `validate_config()` 確認環境變數是否齊全，提早報錯。
+- **高覆蓋率測試**：內建 58 項單元與整合測試（基於 pytest），涵蓋各種輸入格式、錯誤處理與邊界情境。
 
-### 雙引擎解析策略
+---
 
-本專案採用 **LLM + Rule Engine** 雙引擎架構，確保智慧與穩定兼顧：
+## 🏗 系統架構
 
-| 引擎 | 觸發條件 | 信心度 | 能力 |
-|------|---------|--------|------|
-| **LLM Engine** | API Key 已設定且 API 可用 | 95% | 深度自然語言理解、上下文感知、智慧分類 |
-| **Rule Engine** | LLM 不可用或回傳錯誤時 | 60-90% | 關鍵字比對、正則表達式解析 |
+1. **Input Layer (LINE)**: 接收使用者的文字記帳訊息或圖片（圖片限制 10MB，超出自動退回）。
+2. **Processing Layer (Flask + Gemini)**: 
+   - **文字分支**：解析指令或丟入 LLM 解析收支、金額與分類。如果失敗，則交給 Rule Engine 收尾處理。
+   - **圖片分支**：下載圖片交給 Gemini Vision 進行結構化 OCR 解析。
+3. **Output Layer (Notion)**: 透過 Notion API 將 12 個欄位的完整資料（包含稅額、發票號碼等）寫入指定資料庫，並透過 LINE 回傳確認訊息。
 
-- **指令格式** 和 **結構化格式**：永遠使用 Rule Engine（格式確定性高）
-- **自由輸入格式**：優先使用 LLM Engine，失敗時自動降級至 Rule Engine
+---
 
-### 三層式架構
-
-1. **Input Layer (LINE)**: 使用者透過 LINE 發送訊息，LINE 平台將訊息封裝為 Webhook Event 發送至伺服器。
-2. **Processing Layer (Flask + LLM)**: 伺服器接收並驗證請求，透過 LLM API 將非結構化文字轉換為結構化任務資料。
-3. **Output Layer (Notion)**: 透過 Notion API 將結構化資料寫入指定的 Notion 資料庫，並透過 LINE 回傳確認訊息。
-
-## 專案結構
+## 🛠 專案結構
 
 ```
-line-notion-sync/
+LINE-Notion-AccountBook/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py              # Flask 應用程式與 Webhook 進入點
-│   ├── line_handler.py      # LINE Messaging API 處理邏輯
-│   ├── llm_parser.py        # LLM 智慧解析引擎（OpenAI API）
-│   ├── notion_client.py     # Notion API 整合模組
-│   └── data_processor.py    # 雙引擎資料處理與解析邏輯
+│   ├── line_handler.py      # LINE Messaging API（簽章驗證、圖片下載、Push/Reply）
+│   ├── ocr_engine.py        # Gemini Vision API 圖片辨識引擎
+│   ├── llm_parser.py        # Gemini API 自然語言記帳解析引擎
+│   ├── data_processor.py    # 雙引擎資料處理器（LLM/OCR/Rule Fallback）
+│   └── notion_client.py     # Notion API 資料庫寫入層（12欄位）
 ├── config/
 │   ├── __init__.py
-│   └── settings.py          # 環境變數設定檔
+│   └── settings.py          # 環境變數設定與驗證模組 (Fail-fast)
 ├── tests/
-│   ├── test_processor.py    # 資料處理模組測試
-│   └── test_llm_parser.py   # LLM 解析引擎整合測試
-├── docs/
-│   ├── architecture.mmd     # 架構圖原始檔
-│   └── architecture.png     # 架構圖
-├── requirements.txt         # 依賴套件
-├── .env.example             # 環境變數範例
-└── README.md                # 專案說明文件
+│   ├── test_processor.py    # DateProcessor 雙引擎整合測試
+│   ├── test_llm_parser.py   # LLM 引擎單元測試
+│   └── test_ocr_engine.py   # OCR 引擎單元測試
+├── docs/                    # 各種文件與設定手冊
+├── requirements.txt         # 依賴套件 (Flask, requests, python-dotenv, 等)
+└── .env.example             # 環境變數範例檔
 ```
 
-## 前置準備
+---
 
-1. **LINE Official Account**:
-   - 前往 [LINE Developers Console](https://developers.line.biz/) 建立一個 Messaging API Channel。
-   - 取得 `Channel Secret` 與 `Channel Access Token`。
-   - 設定 Webhook URL（例如使用 ngrok：`https://<your-ngrok-url>/webhook`）。
+## 🚀 部署與執行
 
-2. **Notion Integration**:
-   - 前往 [Notion Developers](https://www.notion.so/my-integrations) 建立一個 Internal Integration。
-   - 取得 `Internal Integration Token` (API Key)。
-   - 在 Notion 中建立一個資料庫，並將該資料庫分享給剛建立的 Integration。
-   - 取得資料庫的 ID（從資料庫網址中提取）。
+### 一、事前準備
+1. 前往 **LINE Developers** 建立 Messaging API Channel，取得 `Channel Secret` 與 `Access Token`。（詳細流程請見：[LINE Webhook 設定手冊](docs/LINE_WEBHOOK_SETUP.md)）
+2. 前往 **Notion** 建立一個資料庫（需包含指定的 12 個欄位），並取得 Internal Integration Token 與 Database ID。
+3. 前往 **Google AI Studio** 取得 `GEMINI_API_KEY`（必須支援 Vision 模型）。
 
-3. **OpenAI API Key**（可選，但強烈建議）:
-   - 前往 [OpenAI Platform](https://platform.openai.com/) 取得 API Key。
-   - 若未設定，系統會自動使用 Rule Engine 作為解析引擎。
+### 二、環境變數 (`.env`)
+複製 `.env.example` 為 `.env`，並填寫以下設定：
 
-## 執行環境設定
+```env
+# APP Config
+APP_HOST=0.0.0.0
+APP_PORT=3000
+APP_DEBUG=False
+SCHOOL_NAME=我的補習班
 
-1. 建立虛擬環境並安裝依賴：
-   ```bash
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+# LINE Config
+LINE_CHANNEL_ACCESS_TOKEN=your_line_token
+LINE_CHANNEL_SECRET=your_line_secret
 
-2. 設定環境變數：
-   ```bash
-   export LINE_CHANNEL_ACCESS_TOKEN="your_line_token"
-   export LINE_CHANNEL_SECRET="your_line_secret"
-   export NOTION_API_KEY="your_notion_api_key"
-   export NOTION_DATABASE_ID="your_notion_database_id"
-   export OPENAI_API_KEY="your_openai_api_key"
-   export LLM_MODEL="gpt-4.1-mini"
-   ```
+# Notion Config
+NOTION_API_KEY=secret_your_notion_key
+NOTION_DATABASE_ID=your_notion_database_id
 
-3. 啟動伺服器：
-   ```bash
-   python -m app.main
-   ```
+# LLM / OCR Engine Config
+GEMINI_API_KEY=your_gemini_api_key
+```
 
-## 使用方式
+### 三、本機啟動
+```bash
+# 1. 建立虛擬環境
+python3 -m venv .venv
+source .venv/bin/activate
 
-在 LINE 中向您的機器人發送以下格式的訊息：
+# 2. 安裝依賴
+pip install -r requirements.txt
 
-1. **自由輸入**（由 LLM 智慧解析）：
-   `明天下午三點要開會，優先級高`
-2. **結構化輸入**：
-   `標題: 準備簡報 | 日期: 2026-04-10 | 優先級: 高`
-3. **指令輸入**：
-   `/task 寄送發票 --priority medium --date 2026-04-06`
+# 3. 測試（需 58 項全過）
+pytest tests/ -v
 
-系統會自動解析並將任務寫入 Notion 資料庫，同時在 LINE 中回覆確認訊息（包含使用的解析引擎和信心度）。
+# 4. 啟動伺服器
+python -m app.main
+```
 
-## 內建指令
+---
 
-| 指令 | 說明 |
-|------|------|
-| `/help` 或 `幫助` | 顯示使用說明 |
-| `/status` 或 `狀態` | 查看系統狀態（含 LLM 引擎狀態） |
+## 💬 支援的使用指令與格式
+
+在 LINE 中向您的機器人發送以下內容：
+
+1. **文字輸入**（由 LLM 智慧解析）：
+   - `買了 30 本數學講義 $4500`
+   - `收到王小明下個學期的學費 15000`
+2. **圖片輸入**（發票 / 收據）：
+   - 直接將發票或收據拍照上傳。系統會顯示「OCR 辨識中...」，解析完成後會 Push 記帳結果卡片。
+3. **結構化輸入**：
+   - `摘要: 影印費 | 金額: 300 | 類型: 支出 | 分類: 辦公用品`
+4. **快速指令**：
+   - `/支 影印紙 500`
+   - `/收 張三學費 8000`
+5. **系統輔助指令**：
+   - `/help` 或 `幫助`：顯示系統操作說明。
+   - `/status` 或 `狀態`：查看系統各模組健康狀態（含 LLM 與 OCR 啟用狀態）。
+
+---
+
+## 📄 Notion 資料庫欄位結構 (Schema)
+
+請在 Notion 中建立以下欄位：
+- **摘要** (Title)
+- **金額** (Number)
+- **收支類型** (Select: `收入`, `支出`)
+- **分類** (Select: 14 種預設分類，如 `教材費`, `學費收入`... 等)
+- **日期** (Date)
+- **對象/廠商** (Rich text)
+- **付款方式** (Select)
+- **備註** (Rich text)
+- **發票號碼** (Rich text)
+- **稅額** (Number)
+- **記錄人** (Rich text)
+- **記錄時間** (Date)
