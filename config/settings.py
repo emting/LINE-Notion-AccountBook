@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -12,6 +13,14 @@ load_dotenv()
 
 class ConfigValidationError(Exception):
     """Raised when required environment configuration is missing or invalid."""
+
+def normalize_notion_id(raw: str) -> str:
+    """從字串中萃取出單一合法 UUID，避免因為誤貼多餘字綴導致 API 回傳 404/400。"""
+    if not raw:
+        return ""
+    # 尋找標準的 36 字元 UUID 格式 (8-4-4-4-12)
+    match = re.search(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', raw)
+    return match.group(0) if match else ""
 
 
 def _get_bool(name: str, default: bool = False) -> bool:
@@ -44,8 +53,7 @@ class NotionConfig:
     """Notion API 設定。"""
 
     api_key: str = os.getenv("NOTION_API_KEY", "")
-    # 支援 NOTION_DATA_SOURCE_ID 或舊有的 NOTION_DATABASE_ID
-    data_source_id: str = os.getenv("NOTION_DATA_SOURCE_ID") or os.getenv("NOTION_DATABASE_ID", "")
+    database_id: str = normalize_notion_id(os.getenv("NOTION_DATABASE_ID", ""))
     api_version: str = os.getenv("NOTION_API_VERSION", "2022-06-28")
 
 
@@ -89,7 +97,7 @@ def validate_config() -> bool:
         "LINE_CHANNEL_ACCESS_TOKEN": line_config.channel_access_token,
         "LINE_CHANNEL_SECRET": line_config.channel_secret,
         "NOTION_API_KEY": notion_config.api_key,
-        "NOTION_DATA_SOURCE_ID": notion_config.data_source_id,
+        "NOTION_DATABASE_ID": notion_config.database_id,
         "GEMINI_API_KEY": llm_config.api_key,
     }
 
