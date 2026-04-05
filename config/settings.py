@@ -44,7 +44,8 @@ class NotionConfig:
     """Notion API 設定。"""
 
     api_key: str = os.getenv("NOTION_API_KEY", "")
-    database_id: str = os.getenv("NOTION_DATABASE_ID", "")
+    # 支援 NOTION_DATA_SOURCE_ID 或舊有的 NOTION_DATABASE_ID
+    data_source_id: str = os.getenv("NOTION_DATA_SOURCE_ID") or os.getenv("NOTION_DATABASE_ID", "")
     api_version: str = os.getenv("NOTION_API_VERSION", "2022-06-28")
 
 
@@ -88,7 +89,7 @@ def validate_config() -> bool:
         "LINE_CHANNEL_ACCESS_TOKEN": line_config.channel_access_token,
         "LINE_CHANNEL_SECRET": line_config.channel_secret,
         "NOTION_API_KEY": notion_config.api_key,
-        "NOTION_DATABASE_ID": notion_config.database_id,
+        "NOTION_DATA_SOURCE_ID": notion_config.data_source_id,
         "GEMINI_API_KEY": llm_config.api_key,
     }
 
