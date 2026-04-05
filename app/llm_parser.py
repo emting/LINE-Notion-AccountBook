@@ -31,6 +31,9 @@ category 必須落在以下 14 項之一：
 【收入類】學費收入、教材收入、報名費、其他收入
 【支出類】教材費、房租水電、人事費用、設備維護、辦公用品、餐飲點心、交通費、廣告行銷、保險稅務、其他支出
 
+payment_method 必須落在以下之一：
+現金、刷卡、轉帳、LINE Pay、未指定 (注意大小寫與空格)
+
 請只回傳 JSON，不要包含 markdown。"""
 
 VALID_CATEGORIES = frozenset({
@@ -38,6 +41,10 @@ VALID_CATEGORIES = frozenset({
     "教材費", "房租水電", "人事費用", "設備維護",
     "辦公用品", "餐飲點心", "交通費", "廣告行銷",
     "保險稅務", "其他支出",
+})
+
+VALID_PAYMENT_METHODS = frozenset({
+    "現金", "刷卡", "轉帳", "LINE Pay", "未指定"
 })
 
 
@@ -155,6 +162,13 @@ class LLMParser:
         if category not in VALID_CATEGORIES:
             category = "其他收入" if entry_type == "收入" else "其他支出"
 
+        payment_method = parsed.get("payment_method", "未指定")
+        # 簡單的正規化處理
+        if "line" in payment_method.lower() and "pay" in payment_method.lower():
+            payment_method = "LINE Pay"
+        elif payment_method not in VALID_PAYMENT_METHODS:
+            payment_method = "未指定"
+
         return {
             "title": title,
             "amount": amount,
@@ -162,7 +176,7 @@ class LLMParser:
             "category": category,
             "date": parsed.get("date"),
             "vendor": parsed.get("vendor", ""),
-            "payment_method": parsed.get("payment_method", "未指定"),
+            "payment_method": payment_method,
             "description": parsed.get("description", ""),
             "invoice_number": parsed.get("invoice_number", ""),
             "tax_amount": parsed.get("tax_amount", 0),

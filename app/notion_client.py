@@ -63,37 +63,52 @@ class NotionAccountClient:
         source_user: str = "",
     ) -> dict:
         """建立一筆記帳紀錄並寫入 Notion 資料庫。"""
+        
+        # 取得今天日期 YYYY-MM-DD
+        today_date = datetime.now().strftime("%Y-%m-%d")
+        
         properties: dict = {
             "摘要": {
                 "title": [{"text": {"content": title}}]
             },
-            "金額": {"number": amount},
+            "金額": {"number": float(amount)},
             "收支類型": {"select": {"name": entry_type}},
             "分類": {"select": {"name": category}},
             "付款方式": {"select": {"name": payment_method}},
             "備註": {
-                "rich_text": [{"text": {"content": description[:2000]}}]
+                "rich_text": [{"text": {"content": str(description)[:2000]}}]
                 if description else []
             },
-            "記錄時間": {"date": {"start": datetime.now().isoformat()}},
+            "記錄時間": {"date": {"start": today_date}},
         }
 
-        # 選填欄位
+        # 選填欄位處理
         if date:
-            properties["日期"] = {"date": {"start": date}}
+            # 確保日期格式為 YYYY-MM-DD
+            try:
+                formatted_date = datetime.fromisoformat(date.replace("/", "-")).strftime("%Y-%m-%d")
+                properties["日期"] = {"date": {"start": formatted_date}}
+            except (ValueError, TypeError):
+                properties["日期"] = {"date": {"start": today_date}}
+        else:
+            properties["日期"] = {"date": {"start": today_date}}
+
         if vendor:
             properties["對象/廠商"] = {
-                "rich_text": [{"text": {"content": vendor}}]
+                "rich_text": [{"text": {"content": str(vendor)}}]
             }
+        
         if invoice_number:
             properties["發票號碼"] = {
-                "rich_text": [{"text": {"content": invoice_number}}]
+                "rich_text": [{"text": {"content": str(invoice_number)}}]
             }
-        if tax_amount:
-            properties["稅額"] = {"number": tax_amount}
+        
+        if tax_amount is not None:
+            properties["稅額"] = {"number": float(tax_amount)}
+        
         if source_user:
             properties["記錄人"] = {
-                "rich_text": [{"text": {"content": source_user}}]
+                "rich_text": [{"text": {"content": str(source_user)}}]
             }
 
         return self._create_page(properties)
@@ -109,6 +124,8 @@ class NotionAccountClient:
             response = requests.post(
                 url, headers=self.headers, json=payload, timeout=30
             )
+            if not response.ok:
+                logger.error("Notion API Error: %s", response.text)
             response.raise_for_status()
             return response.json()
         except requests.HTTPError as exc:
