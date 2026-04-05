@@ -129,9 +129,16 @@ class NotionAccountClient:
             response.raise_for_status()
             return response.json()
         except requests.HTTPError as exc:
-            error_body = exc.response.json() if exc.response else {}
+            error_body = exc.response.text if exc.response is not None else str(exc)
+            status_code = exc.response.status_code if exc.response is not None else "Unknown"
+            logger.error(
+                "Notion API Error. Status: %s, Response: %s, Parent: %s",
+                status_code,
+                error_body,
+                payload.get("parent")
+            )
             raise NotionClientError(
-                f"Failed: {error_body.get('message', str(exc))}"
+                f"Failed (Status {status_code}): {error_body}"
             ) from exc
         except requests.RequestException as exc:
             raise NotionClientError(f"Request failed: {exc}") from exc
