@@ -73,7 +73,7 @@ LINE_CHANNEL_SECRET=your_line_secret
 
 # Notion Config
 NOTION_API_KEY=secret_your_notion_key
-NOTION_DATABASE_ID=your_notion_database_id
+NOTION_DATA_SOURCE_ID=your_notion_database_id
 
 # LLM / OCR Engine Config
 GEMINI_API_KEY=your_gemini_api_key
