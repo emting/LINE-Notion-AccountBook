@@ -16,7 +16,7 @@ from flask import Flask, request, abort, jsonify
 from app.line_handler import LineWebhookHandler, LineSignatureError
 from app.notion_client import NotionAccountClient, NotionClientError
 from app.data_processor import DataProcessor
-from config.settings import app_config
+from config.settings import app_config, validate_config, ConfigValidationError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -204,6 +204,10 @@ def _send_status(reply_token):
     line_handler.reply_message(reply_token, status_text)
 
 if __name__ == "__main__":
+    try:
+        validate_config()
+    except ConfigValidationError as e:
+        logger.warning("Config validation warning: %s", e)
     app.run(
         host=app_config.host,
         port=app_config.port,
