@@ -273,3 +273,205 @@ def test_valid_categories_includes_all_types():
                "餐飲點心", "交通費", "廣告行銷", "保險稅務", "其他支出"}
     assert income.issubset(VALID_CATEGORIES)
     assert expense.issubset(VALID_CATEGORIES)
+
+
+# ── 多筆 / 歸屬月份 / 欄位正規化 ──────────────────────
+
+def _parser_returning(monkeypatch, body):
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    payload = {"candidates": [{"content": {"parts": [{"text": json.dumps(body, ensure_ascii=False)}]}}]}
+    captured = {}
+
+    def fake_post(*args, **kwargs):
+        captured["payload"] = kwargs.get("json")
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("app.llm_parser.requests.post", fake_post)
+    return LLMParser(), captured
+
+
+def test_parse_multi_returns_every_entry(monkeypatch):
+    parser, _ = _parser_returning(monkeypatch, {
+        "entries": [
+            {"title": "Liam 七月Workshop", "amount": 15300, "type": "收入", "category": "學費收入"},
+            {"title": "Lyanna 七月Workshop", "amount": "15,300", "type": "收入", "category": "學費收入"},
+            {"title": "", "amount": 1},                      # 沒有摘要 → 略過
+        ],
+        "stated_total": 30600,
+    })
+    result = parser.parse_multi("…")
+    assert [e["title"] for e in result["entries"]] == ["Liam 七月Workshop", "Lyanna 七月Workshop"]
+    assert result["entries"][1]["amount"] == 15300.0
+    assert result["stated_total"] == 30600.0
+    assert result["truncated"] is False
+
+
+def test_parse_multi_accepts_bare_list_and_single_object(monkeypatch):
+    parser, _ = _parser_returning(monkeypatch, [{"title": "房租", "amount": 40369}])
+    assert len(parser.parse_multi("房租 40369")["entries"]) == 1
+
+    parser, _ = _parser_returning(monkeypatch, {"title": "房租", "amount": 40369})
+    assert parser.parse("房租 40369")["title"] == "房租"
+
+
+def test_parse_multi_caps_entries(monkeypatch):
+    from app.llm_parser import MAX_ENTRIES_PER_MESSAGE
+
+    many = [{"title": f"項目{i}", "amount": 100} for i in range(MAX_ENTRIES_PER_MESSAGE + 3)]
+    parser, _ = _parser_returning(monkeypatch, {"entries": many})
+    result = parser.parse_multi("…")
+    assert len(result["entries"]) == MAX_ENTRIES_PER_MESSAGE
+    assert result["truncated"] is True
+
+
+def test_request_allows_long_output(monkeypatch):
+    """輸出上限太小會讓薪資明細這類長訊息的 JSON 被截斷，整則退回規則引擎。"""
+    parser, captured = _parser_returning(monkeypatch, {"title": "x", "amount": 1})
+    parser.parse_multi("x 1")
+    assert captured["payload"]["generationConfig"]["maxOutputTokens"] >= 4096
+
+
+def test_validate_result_normalizes_date_period_and_payment(monkeypatch):
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    parser = LLMParser()
+    result = parser._validate_result({
+        "title": "8月勞保", "amount": 11122, "type": "支出", "category": "保險稅務",
+        "date": "2026/10/4", "period": "2026-8", "payment_method": "匯款",
+        "vendor": None, "components": [{"label": "a", "amount": "1,000"}, "bad"],
+    })
+    assert result["date"] == "2026-10-04"
+    assert result["period"] == "2026-08"
+    assert result["payment_method"] == "轉帳"
+    assert result["vendor"] == ""
+    assert result["components"] == [{"label": "a", "amount": 1000.0}]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("未知", "未指定"),          # OCR 曾回傳「未知」，在 Notion 多出一個選項
+    ("", "未指定"),
+    (None, "未指定"),
+    ("信用卡", "刷卡"),
+    ("line pay", "LINE Pay"),
+    ("現金", "現金"),
+    ("銀行轉帳", "轉帳"),
+])
+def test_normalize_payment_method(raw, expected):
+    from app.llm_parser import normalize_payment_method
+
+    assert normalize_payment_method(raw) == expected
+
+
+def test_validate_result_rejects_bad_date_and_period(monkeypatch):
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    parser = LLMParser()
+    result = parser._validate_result({
+        "title": "x", "amount": 1, "date": "上週五", "period": "2026-13",
+    })
+    assert result["date"] is None and result["period"] is None
+
+
+# ── LLM 回應格式不標準時的容錯 ─────────────────────────
+
+def _llm_reply(monkeypatch, body) -> LLMParser:
+    """建立一個 Gemini 會回傳 body 的 parser；body 可以是 dict/list 或原始字串。"""
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+    payload = {"candidates": [{"content": {"parts": [{"text": text}]}}]}
+    monkeypatch.setattr(
+        "app.llm_parser.requests.post",
+        lambda *args, **kwargs: DummyResponse(payload),
+    )
+    return LLMParser()
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("NT$1,200", 1200.0),
+        ("1200元", 1200.0),
+        ("約 1,200 元", 1200.0),
+        ("TWD 39,900", 39900.0),
+        ("4500.5", 4500.5),
+        (4500, 4500.0),
+        ("-738", 738.0),          # 單筆金額一律取正數
+        ("", 0.0),
+        (None, 0.0),
+        ("不知道", 0.0),
+    ],
+)
+def test_amount_with_currency_text_is_normalized(monkeypatch, raw, expected):
+    """LLM 把金額寫成帶幣別或單位的字串時，仍要取出數字。"""
+    parser = _llm_reply(
+        monkeypatch,
+        {"title": "講義", "amount": raw, "type": "支出", "category": "教材費"},
+    )
+    result = parser.parse("買講義")
+    assert result is not None
+    assert result["amount"] == expected
+
+
+def test_component_amounts_keep_sign_and_drop_units(monkeypatch):
+    """薪資明細的減項要保留負號，帶單位的字串也要能讀。"""
+    parser = _llm_reply(
+        monkeypatch,
+        {
+            "title": "Celia 3月薪資",
+            "amount": "45,214元",
+            "type": "支出",
+            "category": "人事費用",
+            "components": [
+                {"label": "底薪", "amount": "42,750"},
+                {"label": "勞保自付額", "amount": "-738元"},
+                {"label": "備註", "amount": "無"},
+            ],
+        },
+    )
+    result = parser.parse("Celia 3月薪資")
+    assert result["amount"] == 45214.0
+    assert result["components"] == [
+        {"label": "底薪", "amount": 42750.0},
+        {"label": "勞保自付額", "amount": -738.0},
+    ]
+
+
+@pytest.mark.parametrize("text", ["", "   ", None])
+def test_empty_message_does_not_call_llm(monkeypatch, text):
+    """空訊息不該花一次 API 呼叫。"""
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    calls = []
+    monkeypatch.setattr(
+        "app.llm_parser.requests.post",
+        lambda *args, **kwargs: calls.append(1),
+    )
+    assert LLMParser().parse_multi(text) is None
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"candidates": ["not-a-dict"]},
+        {"candidates": [{"content": "not-a-dict"}]},
+        {"candidates": [{"content": {"parts": ["not-a-dict"]}}]},
+        {"candidates": [{"content": {"parts": [{"text": None}]}}]},
+    ],
+)
+def test_malformed_response_shape_returns_none(monkeypatch, payload):
+    """Gemini 回應的結構不如預期時回傳 None（交給規則引擎），不能丟例外。"""
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    monkeypatch.setattr(
+        "app.llm_parser.requests.post",
+        lambda *args, **kwargs: DummyResponse(payload),
+    )
+    assert LLMParser().parse_multi("買講義 500") is None
+
+
+def test_non_string_type_and_category_fall_back(monkeypatch):
+    """type / category 不是字串（例如陣列）時用預設值，不能丟例外。"""
+    parser = _llm_reply(
+        monkeypatch,
+        {"title": "講義", "amount": 500, "type": ["支出"], "category": {"name": "教材費"}},
+    )
+    result = parser.parse("買講義 500")
+    assert result["type"] == "支出"
+    assert result["category"] == "其他支出"

@@ -4,220 +4,158 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 import requests
 
-from config.settings import llm_config
+from config.settings import llm_config, local_today
 
 logger = logging.getLogger(__name__)
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 MAX_RETRIES = 2
 BASE_BACKOFF_SECONDS = 1
+# 一則訊息最多拆成幾筆（避免單一 webhook 寫入過久）
+MAX_ENTRIES_PER_MESSAGE = 15
+# 長訊息（薪資明細、多筆學費）需要較多輸出 token；
+# 過小會讓 JSON 被截斷而整則訊息退回規則引擎。
+MAX_OUTPUT_TOKENS = 4096
 
 SYSTEM_PROMPT = """你是一個專業的補習班記帳助手。將使用者的訊息解析為結構化記帳資料。
 
-請回傳單個 JSON 物件，絕對不要回傳列表或陣列。
-如果使用者訊息包含多筆交易，請只解析第一筆交易。
+請回傳 JSON 物件：{"entries": [ ... ], "stated_total": 數字或 null}
 
-欄位包含：
-title、amount、type、category、date、vendor、payment_method、description、invoice_number、tax_amount。
+■ 拆帳規則
+- 一則訊息若列出多筆各自獨立的收支（例如多位學生、多個課程、多張帳單），entries 內每筆各一個物件。
+- 薪資明細（底薪、獎金、勞健保自付額、代墊款…加減後得到一個實付金額）只算「一筆」，amount 填實付總額，
+  並把每個加減項放進 components。
+- 「總共」「合計」「Total」這類加總行不是一筆交易，不要放進 entries；把該數字填入 stated_total。
+  若訊息沒有寫出跨多筆的總額，stated_total 填 null。
 
-欄位規則：
-1. amount 與 tax_amount 必須是數字，不要包含逗號、貨幣符號或單位。
-2. date 必須使用 YYYY-MM-DD 格式。
-3. vendor、description、invoice_number 若無法判斷，請填空字串。
-4. payment_method 若無法判斷，請填「未指定」。
-
-type 欄位：「收入」或「支出」（依文意判斷）
-判斷規則：
-1. 「收到」「繳費」「入帳」「退款」「學費」 → 收入
-2. 「買」「付」「支付」「花」「購」「修」「租」 → 支出
-
-category 必須落在以下 14 項之一：
-【收入類】學費收入、教材收入、報名費、其他收入
-【支出類】教材費、房租水電、人事費用、設備維護、辦公用品、餐飲點心、交通費、廣告行銷、保險稅務、其他支出
-
-payment_method 必須落在以下之一：
-現金、刷卡、轉帳、LINE Pay、未指定
+■ 每筆 entries 的欄位
+- title：15 字以內的簡短摘要，格式「對象 + 月份/期別 + 項目」，例如「Celia 3月薪資」「Liam 七月Workshop」「8月勞保」。
+  不要包含金額、表情符號、Markdown 符號或算式。
+- amount：正數，實際收付金額（折扣後、加減後的最終金額）。
+- type：「收入」或「支出」。
+  收到、繳費、入帳、學費、報名 → 收入；買、付、支付、花、購、修、租、薪資、匯給 → 支出。
+  退費給學生或家長 → 支出；收到廠商退款 → 收入。
+- category：必須是下列 14 項之一，且要與 type 相符。
+  【收入類】學費收入、教材收入、報名費、其他收入
+  【支出類】教材費、房租水電、人事費用、設備維護、辦公用品、餐飲點心、交通費、廣告行銷、保險稅務、其他支出
+  固定歸類：
+  · 課程、Workshop、營隊、學費（含早鳥價、折扣價）→ 學費收入（只有單獨收取的報名手續費才用「報名費」）
+  · 薪資、薪水、獎金、bonus、鐘點費、勞退 → 人事費用
+  · 勞保、健保、災保、工會勞健保、各種稅 → 保險稅務
+  · 房租、租金、管理費、水費、電費、網路 → 房租水電
+  · 飲料、點心、便當、餐費、食材 → 餐飲點心
+- date：實際收付日期 YYYY-MM-DD。只有訊息明確提到日期（今天、昨天、10/4、上週五…）才填，否則填 null。
+  不要把「8月勞保」「三月薪資」這種歸屬月份當成日期。
+- period：這筆帳歸屬的月份 YYYY-MM（例如「8月勞保」→ 當年 08 月、「三月薪資」→ 03 月）。
+  訊息有寫年份就照寫；沒寫年份時，支出取最近一次已到來的該月份（最晚到下個月），
+  收入若該月份落在未來 6 個月內取未來、否則取過去。訊息沒有提到歸屬月份就填 null。
+- vendor：收付款對象。收入填學生/家長姓名，薪資填老師姓名，其餘填店家或機構；看不出來填 ""。
+- payment_method：現金、刷卡、轉帳、LINE Pay、未指定 之一（訊息沒提就填「未指定」）。
+- description：補充說明（折扣原因、品項、算式等），沒有就填 ""。不要只是重複 title。
+- invoice_number：發票號碼，沒有填 ""。
+- tax_amount：稅額數字，沒有填 0。
+- components：只有 amount 是由多個加減項算出來時才填，
+  格式 [{"label": "底薪", "amount": 42750}, {"label": "勞保自付額", "amount": -738}]，
+  加項為正、減項為負，照訊息原文的數字填，不要自行修正。其他情況填 []。
 
 請只回傳 JSON，不要包含 markdown。"""
 
-INCOME_CATEGORIES = frozenset({
-    "學費收入",
-    "教材收入",
-    "報名費",
-    "其他收入",
-})
-
+INCOME_CATEGORIES = frozenset({"學費收入", "教材收入", "報名費", "其他收入"})
 EXPENSE_CATEGORIES = frozenset({
-    "教材費",
-    "房租水電",
-    "人事費用",
-    "設備維護",
-    "辦公用品",
-    "餐飲點心",
-    "交通費",
-    "廣告行銷",
-    "保險稅務",
-    "其他支出",
+    "教材費", "房租水電", "人事費用", "設備維護",
+    "辦公用品", "餐飲點心", "交通費", "廣告行銷",
+    "保險稅務", "其他支出",
 })
-
 VALID_CATEGORIES = INCOME_CATEGORIES | EXPENSE_CATEGORIES
 
 VALID_PAYMENT_METHODS = frozenset({
-    "現金",
-    "刷卡",
-    "轉帳",
-    "LINE Pay",
-    "未指定",
+    "現金", "刷卡", "轉帳", "LINE Pay", "未指定"
 })
 
-
-def _safe_string(value: Any) -> str:
-    """安全轉換為去除前後空白的字串。"""
-    return str(value or "").strip()
+_PERIOD_RE = re.compile(r"^(\d{4})[-/](\d{1,2})$")
 
 
-def _normalize_amount(value: Any) -> float:
-    """將金額欄位正規化為非負浮點數。"""
-    if value is None or value == "":
-        return 0.0
+def normalize_payment_method(value: object) -> str:
+    """把任意付款方式字串收斂到 Notion 既有的 5 個選項。
 
-    try:
-        if isinstance(value, str):
-            cleaned = value.strip()
-
-            # 移除常見貨幣符號、單位與分隔符號
-            cleaned = cleaned.replace(",", "")
-            cleaned = cleaned.replace("NT$", "")
-            cleaned = cleaned.replace("NTD", "")
-            cleaned = cleaned.replace("TWD", "")
-            cleaned = cleaned.replace("NT", "")
-            cleaned = cleaned.replace("$", "")
-            cleaned = cleaned.replace("元", "")
-            cleaned = cleaned.strip()
-
-            # 若字串中仍包含其他文字，嘗試抓第一個數字
-            # 例如：「約 1,200 元」經前面處理後可能變成「約 1200」
-            match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
-            if match:
-                cleaned = match.group(0)
-
-            return abs(float(cleaned))
-
-        return abs(float(value))
-
-    except (TypeError, ValueError):
-        logger.warning("Unable to normalize amount: %r", value)
-        return 0.0
-
-
-def _normalize_type(value: Any) -> str:
-    """正規化收入/支出類型。"""
-    entry_type = _safe_string(value)
-
-    if entry_type in {"收入", "支出"}:
-        return entry_type
-
-    return "支出"
-
-
-def _normalize_category(value: Any, entry_type: str) -> str:
-    """依收入/支出類型正規化類別，避免類別與類型錯配。"""
-    category = _safe_string(value)
-
-    if entry_type == "收入":
-        if category in INCOME_CATEGORIES:
-            return category
-        return "其他收入"
-
-    if category in EXPENSE_CATEGORIES:
-        return category
-
-    return "其他支出"
-
-
-def _normalize_payment_method(value: Any) -> str:
-    """正規化付款方式。"""
-    payment_method = _safe_string(value)
-
-    if not payment_method:
+    Notion 的 select 欄位遇到沒看過的值會自動新增選項，
+    所以「未知」「信用卡」這類值必須在寫入前擋下來。
+    """
+    text = str(value or "").strip()
+    if not text:
         return "未指定"
-
-    lower_value = payment_method.lower()
-
-    if "line" in lower_value and "pay" in lower_value:
+    lowered = text.lower().replace(" ", "")
+    if "line" in lowered and "pay" in lowered:
         return "LINE Pay"
-
+    if text in VALID_PAYMENT_METHODS:
+        return text
     aliases = {
-        "信用卡": "刷卡",
-        "卡": "刷卡",
-        "刷信用卡": "刷卡",
-        "刷卡付款": "刷卡",
-        "匯款": "轉帳",
-        "銀行轉帳": "轉帳",
-        "轉帳付款": "轉帳",
-        "現金付款": "現金",
-        "cash": "現金",
-        "credit card": "刷卡",
-        "card": "刷卡",
-        "transfer": "轉帳",
-        "bank transfer": "轉帳",
-        "linepay": "LINE Pay",
-        "line pay": "LINE Pay",
+        "現金": ("現金", "cash", "付現"),
+        "刷卡": ("刷卡", "信用卡", "credit", "visa", "master"),
+        "轉帳": ("轉帳", "匯款", "匯入", "atm", "transfer", "銀行"),
     }
-
-    if payment_method in aliases:
-        return aliases[payment_method]
-
-    if lower_value in aliases:
-        return aliases[lower_value]
-
-    if payment_method in VALID_PAYMENT_METHODS:
-        return payment_method
-
+    for canonical, keywords in aliases.items():
+        if any(keyword in lowered for keyword in keywords):
+            return canonical
     return "未指定"
 
 
-def _normalize_date(value: Any) -> str:
-    """簡單正規化日期，無法判斷時回傳今天。"""
-    today = datetime.now().strftime("%Y-%m-%d")
+def normalize_date(value: object) -> Optional[str]:
+    """將日期字串正規化為 YYYY-MM-DD；無法解析則回傳 None。"""
+    if not value:
+        return None
+    text = str(value).strip().replace("/", "-").replace(".", "-")
+    match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", text)
+    if not match:
+        return None
+    try:
+        return datetime(
+            int(match.group(1)), int(match.group(2)), int(match.group(3))
+        ).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
 
-    if value is None or value == "":
-        return today
 
-    date_text = _safe_string(value)
+def normalize_period(value: object) -> Optional[str]:
+    """將歸屬月份正規化為 YYYY-MM；無法解析則回傳 None。"""
+    if not value:
+        return None
+    match = _PERIOD_RE.match(str(value).strip()[:7])
+    if not match:
+        return None
+    month = int(match.group(2))
+    if not 1 <= month <= 12:
+        return None
+    return f"{match.group(1)}-{month:02d}"
 
-    if date_text in {"今天", "今日"}:
-        return today
 
-    # 接受 YYYY-MM-DD
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
-        try:
-            return datetime.strptime(date_text, "%Y-%m-%d").strftime("%Y-%m-%d")
-        except ValueError:
-            return today
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
-    # 接受 YYYY/M/D 或 YYYY/MM/DD
-    if re.fullmatch(r"\d{4}/\d{1,2}/\d{1,2}", date_text):
-        try:
-            return datetime.strptime(date_text, "%Y/%m/%d").strftime("%Y-%m-%d")
-        except ValueError:
-            return today
 
-    # 接受 YYYY.M.D 或 YYYY.MM.DD
-    if re.fullmatch(r"\d{4}\.\d{1,2}\.\d{1,2}", date_text):
-        try:
-            return datetime.strptime(date_text, "%Y.%m.%d").strftime("%Y-%m-%d")
-        except ValueError:
-            return today
+def _to_float(value: object) -> float:
+    """把 LLM 回傳的金額轉成數字，保留正負號；看不懂就回傳 0。
 
-    return today
+    LLM 偶爾會把金額寫成字串並帶上幣別或單位（"NT$1,200"、"1200元"、
+    "約 1,200 元"），這裡取出其中第一個數字。
+    """
+    if value is None or isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else 0.0
+    match = _NUMBER_RE.search(str(value).replace(",", "").replace("，", ""))
+    if not match:
+        if str(value).strip():
+            logger.warning("Unable to normalize amount: %r", value)
+        return 0.0
+    return float(match.group(0))
 
 
 class LLMParser:
@@ -234,7 +172,7 @@ class LLMParser:
             logger.warning("LLM Parser disabled: GEMINI_API_KEY not configured.")
 
     def _post_with_retry(self, payload: dict) -> Optional[dict]:
-        """向 Gemini API 發送請求，失敗時指數退避重試。"""
+        """向 Gemini API 發送請求，失敗時指數退避重試（最多 MAX_RETRIES 次）。"""
         if not self.api_key:
             return None
 
@@ -253,62 +191,55 @@ class LLMParser:
                 )
                 response.raise_for_status()
                 return response.json()
-
             except requests.RequestException as exc:
                 is_last_attempt = attempt == MAX_RETRIES
-
                 logger.warning(
-                    "LLM request failed on attempt %d/%d: %s",
-                    attempt + 1,
-                    MAX_RETRIES + 1,
-                    exc,
+                    "LLM request failed on attempt %d: %s", attempt + 1, exc
                 )
-
                 if is_last_attempt:
-                    logger.error(
-                        "LLM API failed after %d retries: %s",
-                        MAX_RETRIES,
-                        exc,
-                    )
+                    logger.error("LLM API failed after %d retries: %s", MAX_RETRIES, exc)
                     return None
-
                 time.sleep(BASE_BACKOFF_SECONDS * (2 ** attempt))
 
         return None
 
     def parse(self, text: str) -> Optional[dict]:
         """
-        將自然語言文字解析為結構化記帳 dict。
+        將自然語言文字解析為單筆結構化記帳 dict（取第一筆）。
+
+        保留給只需要單筆結果的呼叫端；一則訊息多筆請用 parse_multi()。
+        """
+        result = self.parse_multi(text)
+        if not result or not result["entries"]:
+            return None
+        return result["entries"][0]
+
+    def parse_multi(self, text: str) -> Optional[dict]:
+        """
+        將自然語言文字解析為一或多筆記帳資料。
 
         Args:
-            text: 使用者輸入的記帳訊息。
+            text: 使用者輸入的記帳訊息
 
         Returns:
-            已驗證且正規化後的 dict，或 None。
+            {"entries": [已驗證的 dict, ...], "stated_total": float | None}，
+            或 None（解析失敗 / 沒有任何有效的一筆）
         """
         if not self.enabled:
             return None
 
-        text = _safe_string(text)
+        text = str(text or "").strip()
         if not text:
             return None
 
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = local_today()
         full_prompt = f"{SYSTEM_PROMPT}\n今天日期：{today}\n\n使用者訊息：{text}"
 
         payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text": full_prompt,
-                        }
-                    ]
-                }
-            ],
+            "contents": [{"parts": [{"text": full_prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 800,
+                "maxOutputTokens": MAX_OUTPUT_TOKENS,
                 "responseMimeType": "application/json",
             },
         }
@@ -320,94 +251,98 @@ class LLMParser:
         try:
             candidates = data.get("candidates", [])
             if not candidates:
-                logger.error("LLM response has no candidates.")
                 return None
-
+            finish_reason = candidates[0].get("finishReason")
+            if finish_reason and finish_reason != "STOP":
+                logger.warning("LLM finished with reason: %s", finish_reason)
             parts = candidates[0].get("content", {}).get("parts", [])
             if not parts:
-                logger.error("LLM response has no content parts.")
                 return None
 
             text_result = parts[0].get("text", "").strip()
-            if not text_result:
-                logger.error("LLM response text is empty.")
-                return None
-
-            text_result = self._strip_markdown_code_block(text_result)
+            if text_result.startswith("```"):
+                lines = text_result.split("\n")
+                text_result = "\n".join(lines[1:-1])
 
             parsed = json.loads(text_result)
-            return self._validate_result(parsed)
-
         except json.JSONDecodeError as exc:
             logger.error("Failed to parse LLM JSON: %s", exc)
             return None
-
-        except Exception as exc:
+        except Exception as exc:  # 回應形狀不如預期時退回規則引擎，不讓 webhook 掛掉
             logger.exception("Unexpected error while parsing LLM response: %s", exc)
             return None
 
-    def _strip_markdown_code_block(self, text_result: str) -> str:
-        """移除 LLM 可能回傳的 markdown code block。"""
-        text_result = text_result.strip()
+        # 相容三種回傳形狀：{"entries": [...]}、[...]、單一物件
+        stated_total = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("entries"), list):
+            raw_entries = parsed["entries"]
+            stated_total = _to_float(parsed.get("stated_total")) or None
+        elif isinstance(parsed, list):
+            raw_entries = parsed
+        elif isinstance(parsed, dict):
+            raw_entries = [parsed]
+        else:
+            return None
 
-        if not text_result.startswith("```"):
-            return text_result
+        entries = []
+        for raw in raw_entries[:MAX_ENTRIES_PER_MESSAGE]:
+            if not isinstance(raw, dict):
+                continue
+            validated = self._validate_result(raw)
+            if validated:
+                entries.append(validated)
+        if not entries:
+            return None
 
-        lines = text_result.splitlines()
+        return {
+            "entries": entries,
+            "stated_total": stated_total,
+            "truncated": len(raw_entries) > MAX_ENTRIES_PER_MESSAGE,
+        }
 
-        # 例如：
-        # ```json
-        # {...}
-        # ```
-        if len(lines) >= 3 and lines[-1].strip() == "```":
-            return "\n".join(lines[1:-1]).strip()
-
-        # 保底處理：直接移除反引號
-        return text_result.strip("`").strip()
-
-    def _validate_result(self, parsed: Any) -> Optional[dict]:
+    def _validate_result(self, parsed: dict) -> Optional[dict]:
         """驗證並正規化 LLM 回傳的記帳資料。"""
-        if isinstance(parsed, list):
-            if not parsed:
-                logger.error("LLM returned an empty list.")
-                return None
-
-            logger.warning(
-                "LLM returned a list with %d item(s); using the first item.",
-                len(parsed),
-            )
-            parsed = parsed[0]
-
-        if not isinstance(parsed, dict):
-            logger.error("LLM result is not a dict: %s", type(parsed))
-            return None
-
-        title = _safe_string(parsed.get("title"))
+        title = str(parsed.get("title") or "").strip()
         if not title:
-            logger.error("LLM result missing title.")
             return None
 
-        amount = _normalize_amount(parsed.get("amount"))
-        tax_amount = _normalize_amount(parsed.get("tax_amount"))
+        amount = abs(_to_float(parsed.get("amount")))
 
-        entry_type = _normalize_type(parsed.get("type"))
-        category = _normalize_category(parsed.get("category"), entry_type)
-        payment_method = _normalize_payment_method(parsed.get("payment_method"))
-        date = _normalize_date(parsed.get("date"))
+        entry_type = str(parsed.get("type") or "").strip()
+        if entry_type not in {"收入", "支出"}:
+            entry_type = "支出"
+
+        category = str(parsed.get("category") or "").strip()
+        if category not in VALID_CATEGORIES:
+            category = "其他收入" if entry_type == "收入" else "其他支出"
+
+        components = []
+        raw_components = parsed.get("components")
+        if isinstance(raw_components, list):
+            for item in raw_components:
+                if not isinstance(item, dict):
+                    continue
+                value = _to_float(item.get("amount"))
+                if value:
+                    components.append({
+                        "label": str(item.get("label") or "").strip(),
+                        "amount": value,
+                    })
 
         return {
             "title": title,
             "amount": amount,
             "type": entry_type,
             "category": category,
-            "date": date,
-            "vendor": _safe_string(parsed.get("vendor")),
-            "payment_method": payment_method,
-            "description": _safe_string(parsed.get("description")),
-            "invoice_number": _safe_string(parsed.get("invoice_number")),
-            "tax_amount": tax_amount,
+            "date": normalize_date(parsed.get("date")),
+            "period": normalize_period(parsed.get("period")),
+            "vendor": str(parsed.get("vendor") or "").strip(),
+            "payment_method": normalize_payment_method(parsed.get("payment_method")),
+            "description": str(parsed.get("description") or "").strip(),
+            "invoice_number": str(parsed.get("invoice_number") or "").strip(),
+            "tax_amount": abs(_to_float(parsed.get("tax_amount"))),
+            "components": components,
         }
 
     def is_available(self) -> bool:
-        """確認 LLM Parser 是否可用。"""
         return self.enabled
