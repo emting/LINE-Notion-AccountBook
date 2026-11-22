@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime
@@ -136,13 +137,25 @@ def normalize_period(value: object) -> Optional[str]:
     return f"{match.group(1)}-{month:02d}"
 
 
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
 def _to_float(value: object) -> float:
-    if isinstance(value, str):
-        value = value.replace(",", "").replace("$", "").strip()
-    try:
-        return float(value) if value else 0.0
-    except (TypeError, ValueError):
+    """把 LLM 回傳的金額轉成數字，保留正負號；看不懂就回傳 0。
+
+    LLM 偶爾會把金額寫成字串並帶上幣別或單位（"NT$1,200"、"1200元"、
+    "約 1,200 元"），這裡取出其中第一個數字。
+    """
+    if value is None or isinstance(value, bool):
         return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else 0.0
+    match = _NUMBER_RE.search(str(value).replace(",", "").replace("，", ""))
+    if not match:
+        if str(value).strip():
+            logger.warning("Unable to normalize amount: %r", value)
+        return 0.0
+    return float(match.group(0))
 
 
 class LLMParser:
@@ -215,6 +228,10 @@ class LLMParser:
         if not self.enabled:
             return None
 
+        text = str(text or "").strip()
+        if not text:
+            return None
+
         today = local_today()
         full_prompt = f"{SYSTEM_PROMPT}\n今天日期：{today}\n\n使用者訊息：{text}"
 
@@ -250,6 +267,9 @@ class LLMParser:
             parsed = json.loads(text_result)
         except json.JSONDecodeError as exc:
             logger.error("Failed to parse LLM JSON: %s", exc)
+            return None
+        except Exception as exc:  # 回應形狀不如預期時退回規則引擎，不讓 webhook 掛掉
+            logger.exception("Unexpected error while parsing LLM response: %s", exc)
             return None
 
         # 相容三種回傳形狀：{"entries": [...]}、[...]、單一物件
@@ -288,11 +308,11 @@ class LLMParser:
 
         amount = abs(_to_float(parsed.get("amount")))
 
-        entry_type = parsed.get("type", "支出")
+        entry_type = str(parsed.get("type") or "").strip()
         if entry_type not in {"收入", "支出"}:
             entry_type = "支出"
 
-        category = parsed.get("category", "其他支出")
+        category = str(parsed.get("category") or "").strip()
         if category not in VALID_CATEGORIES:
             category = "其他收入" if entry_type == "收入" else "其他支出"
 
